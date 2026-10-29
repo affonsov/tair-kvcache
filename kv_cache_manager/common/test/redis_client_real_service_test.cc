@@ -117,6 +117,40 @@ TEST_F(RedisClientRealServiceTest, TestSimple) {
     redis_client_->Close();
 }
 
+TEST_F(RedisClientRealServiceTest, TestBinaryStrings) {
+    ASSERT_TRUE(redis_client_->Open());
+
+    std::string binary_key = "redis_client_binary_key_1";
+    binary_key.append("\0\x80\xff", 3);
+    std::string empty_value_key = "redis_client_binary_key_2";
+    empty_value_key.append("\0\xfe", 2);
+    std::string binary_value = "binary_value";
+    binary_value.append("\0\x81\xff", 3);
+
+    const std::vector<std::string> keys{binary_key, empty_value_key};
+    const std::vector<std::string> values{binary_value, ""};
+    (void)redis_client_->Delete(keys);
+
+    EXPECT_EQ(std::vector<ErrorCode>(keys.size(), EC_OK), redis_client_->SetStrings(keys, values));
+
+    std::vector<std::string> out_values;
+    EXPECT_EQ(std::vector<ErrorCode>(keys.size(), EC_OK), redis_client_->GetStrings(keys, out_values));
+    EXPECT_EQ(values, out_values);
+
+    std::vector<bool> out_is_exist_vec;
+    EXPECT_EQ(std::vector<ErrorCode>(keys.size(), EC_OK), redis_client_->Exists(keys, out_is_exist_vec));
+    EXPECT_EQ(std::vector<bool>(keys.size(), true), out_is_exist_vec);
+
+    EXPECT_EQ(std::vector<ErrorCode>(keys.size(), EC_OK), redis_client_->Delete(keys));
+    EXPECT_EQ(std::vector<ErrorCode>(keys.size(), EC_NOENT), redis_client_->GetStrings(keys, out_values));
+    EXPECT_EQ(std::vector<std::string>(keys.size()), out_values);
+    EXPECT_EQ(std::vector<ErrorCode>(keys.size(), EC_OK), redis_client_->Exists(keys, out_is_exist_vec));
+    EXPECT_EQ(std::vector<bool>(keys.size(), false), out_is_exist_vec);
+
+    (void)redis_client_->Delete(keys);
+    redis_client_->Close();
+}
+
 TEST_F(RedisClientRealServiceTest, TestNotExistKey) {
     ASSERT_TRUE(redis_client_->Open());
 

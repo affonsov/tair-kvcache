@@ -201,6 +201,99 @@ TEST_F(RedisClientTest, TestSet) {
     }
 }
 
+TEST_F(RedisClientTest, TestSetStringsPipelineAndReplyValidation) {
+    EXPECT_CALL(*redis_client_, IsContextOk()).WillRepeatedly(Return(true));
+
+    const std::string binary_key("key\0\x80", 5);
+    const std::string binary_value("value\0\xff", 7);
+    const std::vector<std::string> keys{binary_key, "key2", "key3", "key4", "key5"};
+    const std::vector<std::string> values{binary_value, "", "value3", "value4", "value5"};
+
+    std::vector<ReplyUPtr> prepared_replies;
+    prepared_replies.emplace_back(MakeFakeReply(REDIS_REPLY_STATUS, "OK"));
+    prepared_replies.emplace_back(MakeFakeReply(REDIS_REPLY_STATUS, std::string("OK\0", 3)));
+    prepared_replies.emplace_back(MakeFakeReply(REDIS_REPLY_ERROR, "ERR"));
+    prepared_replies.emplace_back(MakeFakeReplyInteger(1));
+    prepared_replies.emplace_back(nullptr, freeReplyObject);
+    EXPECT_CALL(*redis_client_,
+                TryExecPipeline(ElementsAre(ElementsAre(StrEq("SET"), StrEq(binary_key), StrEq(binary_value)),
+                                            ElementsAre(StrEq("SET"), StrEq("key2"), StrEq("")),
+                                            ElementsAre(StrEq("SET"), StrEq("key3"), StrEq("value3")),
+                                            ElementsAre(StrEq("SET"), StrEq("key4"), StrEq("value4")),
+                                            ElementsAre(StrEq("SET"), StrEq("key5"), StrEq("value5")))))
+        .WillOnce(Return(ByMove(std::move(prepared_replies))));
+
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_ERROR, EC_ERROR, EC_ERROR, EC_ERROR}),
+              redis_client_->SetStrings(keys, values));
+}
+
+TEST_F(RedisClientTest, TestSetStringsReplyCountMismatch) {
+    EXPECT_CALL(*redis_client_, IsContextOk()).WillRepeatedly(Return(true));
+
+    std::vector<ReplyUPtr> prepared_replies;
+    prepared_replies.emplace_back(MakeFakeReply(REDIS_REPLY_STATUS, "OK"));
+    prepared_replies.emplace_back(MakeFakeReply(REDIS_REPLY_STATUS, "OK"));
+    prepared_replies.emplace_back(MakeFakeReply(REDIS_REPLY_STATUS, "OK"));
+    EXPECT_CALL(*redis_client_, TryExecPipeline(_)).WillOnce(Return(ByMove(std::move(prepared_replies))));
+
+    const std::vector<std::string> keys{"key1", "key2"};
+    ASSERT_EQ(std::vector<ErrorCode>(keys.size(), EC_ERROR), redis_client_->SetStrings(keys, {"value1", "value2"}));
+}
+
+TEST_F(RedisClientTest, TestStringCommandsBadArgumentsAndEmptyInputDoNoIo) {
+    EXPECT_CALL(*redis_client_, TryExecPipeline(_)).Times(0);
+
+    ASSERT_EQ(std::vector<ErrorCode>(2, EC_BADARGS), redis_client_->SetStrings({"key1", "key2"}, {"value1"}));
+    ASSERT_TRUE(redis_client_->SetStrings({}, {}).empty());
+
+    std::vector<std::string> out_values{"stale"};
+    ASSERT_TRUE(redis_client_->GetStrings({}, out_values).empty());
+    ASSERT_TRUE(out_values.empty());
+}
+
+TEST_F(RedisClientTest, TestGetStringsPipelineAndReplyAlignment) {
+    EXPECT_CALL(*redis_client_, IsContextOk()).WillRepeatedly(Return(true));
+
+    const std::string binary_key("key\0\xfe", 5);
+    const std::string binary_value("value\0\x80\xff", 8);
+    const std::vector<std::string> keys{binary_key, "key2", "key3", "key4", "key5", "key6"};
+
+    std::vector<ReplyUPtr> prepared_replies;
+    prepared_replies.emplace_back(MakeFakeReply(REDIS_REPLY_STRING, binary_value));
+    prepared_replies.emplace_back(MakeFakeReply(REDIS_REPLY_STRING, ""));
+    prepared_replies.emplace_back(MakeFakeReply(REDIS_REPLY_NIL, ""));
+    prepared_replies.emplace_back(MakeFakeReply(REDIS_REPLY_ERROR, "ERR"));
+    prepared_replies.emplace_back(MakeFakeReplyInteger(1));
+    prepared_replies.emplace_back(nullptr, freeReplyObject);
+    EXPECT_CALL(*redis_client_,
+                TryExecPipeline(ElementsAre(ElementsAre(StrEq("GET"), StrEq(binary_key)),
+                                            ElementsAre(StrEq("GET"), StrEq("key2")),
+                                            ElementsAre(StrEq("GET"), StrEq("key3")),
+                                            ElementsAre(StrEq("GET"), StrEq("key4")),
+                                            ElementsAre(StrEq("GET"), StrEq("key5")),
+                                            ElementsAre(StrEq("GET"), StrEq("key6")))))
+        .WillOnce(Return(ByMove(std::move(prepared_replies))));
+
+    std::vector<std::string> out_values{"stale"};
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK, EC_NOENT, EC_ERROR, EC_ERROR, EC_ERROR}),
+              redis_client_->GetStrings(keys, out_values));
+    ASSERT_EQ((std::vector<std::string>{binary_value, "", "", "", "", ""}), out_values);
+}
+
+TEST_F(RedisClientTest, TestGetStringsShortReplyFailsClosed) {
+    EXPECT_CALL(*redis_client_, IsContextOk()).WillRepeatedly(Return(true));
+
+    std::vector<ReplyUPtr> prepared_replies;
+    prepared_replies.emplace_back(MakeFakeReply(REDIS_REPLY_STRING, "must-not-shift"));
+    prepared_replies.emplace_back(MakeFakeReply(REDIS_REPLY_NIL, ""));
+    EXPECT_CALL(*redis_client_, TryExecPipeline(_)).WillOnce(Return(ByMove(std::move(prepared_replies))));
+
+    const std::vector<std::string> keys{"key1", "key2", "key3"};
+    std::vector<std::string> out_values{"stale"};
+    ASSERT_EQ(std::vector<ErrorCode>(keys.size(), EC_ERROR), redis_client_->GetStrings(keys, out_values));
+    ASSERT_EQ(std::vector<std::string>(keys.size()), out_values);
+}
+
 TEST_F(RedisClientTest, TestUpdate) {
     EXPECT_CALL(*redis_client_, IsContextOk()).WillRepeatedly(Return(true));
     {

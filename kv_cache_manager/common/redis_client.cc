@@ -1,6 +1,7 @@
 #include "kv_cache_manager/common/redis_client.h"
 
 #include <cassert>
+#include <cstring>
 #include <unordered_set>
 
 #include "kv_cache_manager/common/logger.h"
@@ -268,6 +269,83 @@ bool RedisClient::Open() {
 }
 
 void RedisClient::Close() { Disconnect(); }
+
+std::vector<ErrorCode> RedisClient::SetStrings(const std::vector<std::string> &keys,
+                                               const std::vector<std::string> &values) {
+    if (keys.size() != values.size()) {
+        KVCM_REDIS_LOG_ERROR("redis set strings fail, keys.size[%lu] != values.size[%lu]", keys.size(), values.size());
+        return std::vector<ErrorCode>(keys.size(), EC_BADARGS);
+    }
+    if (keys.empty()) {
+        return {};
+    }
+
+    std::vector<CmdArgs> set_cmds;
+    set_cmds.reserve(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        set_cmds.push_back({"SET", keys[i], values[i]});
+    }
+
+    std::vector<ReplyUPtr> set_replies = CommandPipeline(set_cmds);
+    if (set_replies.size() != keys.size()) {
+        KVCM_REDIS_LOG_ERROR("redis set strings fail, pipeline keys.size[%lu] != set_replies.size[%lu]",
+                             keys.size(),
+                             set_replies.size());
+        return std::vector<ErrorCode>(keys.size(), EC_ERROR);
+    }
+
+    std::vector<ErrorCode> ec_per_key;
+    ec_per_key.reserve(keys.size());
+    for (const ReplyUPtr &set_reply : set_replies) {
+        const redisReply *reply = set_reply.get();
+        if (!IsReplyOk(reply) || reply->type != REDIS_REPLY_STATUS || !reply->str || reply->len != 2 ||
+            memcmp(reply->str, "OK", 2) != 0) {
+            ec_per_key.emplace_back(EC_ERROR);
+        } else {
+            ec_per_key.emplace_back(EC_OK);
+        }
+    }
+    return ec_per_key;
+}
+
+std::vector<ErrorCode> RedisClient::GetStrings(const std::vector<std::string> &keys,
+                                               std::vector<std::string> &out_values) {
+    out_values.assign(keys.size(), std::string());
+    if (keys.empty()) {
+        return {};
+    }
+
+    std::vector<CmdArgs> get_cmds;
+    get_cmds.reserve(keys.size());
+    for (const std::string &key : keys) {
+        get_cmds.push_back({"GET", key});
+    }
+
+    std::vector<ReplyUPtr> get_replies = CommandPipeline(get_cmds);
+    if (get_replies.size() != keys.size()) {
+        KVCM_REDIS_LOG_ERROR("redis get strings fail, pipeline keys.size[%lu] != get_replies.size[%lu]",
+                             keys.size(),
+                             get_replies.size());
+        return std::vector<ErrorCode>(keys.size(), EC_ERROR);
+    }
+
+    std::vector<ErrorCode> ec_per_key;
+    ec_per_key.reserve(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        const redisReply *reply = get_replies[i].get();
+        if (!IsReplyOk(reply)) {
+            ec_per_key.emplace_back(EC_ERROR);
+        } else if (reply->type == REDIS_REPLY_NIL) {
+            ec_per_key.emplace_back(EC_NOENT);
+        } else if (reply->type != REDIS_REPLY_STRING || !reply->str) {
+            ec_per_key.emplace_back(EC_ERROR);
+        } else {
+            out_values[i].assign(reply->str, reply->len);
+            ec_per_key.emplace_back(EC_OK);
+        }
+    }
+    return ec_per_key;
+}
 
 // --- Static command builders ---
 
