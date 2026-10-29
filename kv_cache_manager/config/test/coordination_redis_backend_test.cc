@@ -1,8 +1,12 @@
+#include <chrono>
+#include <condition_variable>
 #include <gtest/gtest.h>
 #include <memory>
+#include <mutex>
 
 #include "kv_cache_manager/common/redis_client_ext.h"
 #include "kv_cache_manager/common/test/redis_test_environment.h"
+#include "kv_cache_manager/config/leader_elector.h"
 #include "kv_cache_manager/config/test/coordination_backend_test_base.h"
 
 namespace kv_cache_manager {
@@ -302,6 +306,70 @@ TEST_F(CoordinationRedisDiffClusterNameTest, TestLeaderElectionKeyIsolation) {
 
     ASSERT_EQ(EC_OK, backend_cluster_a_->Unlock(leader_lock_key, "node_a"));
     ASSERT_EQ(EC_OK, backend_cluster_b_->Unlock(leader_lock_key, "node_b"));
+}
+
+TEST(CoordinationRedisLeaderElectionTest, ExpiredDeadHolderPromotesFollowerWithinOneSecond) {
+    using Clock = std::chrono::steady_clock;
+
+    const std::string cluster_name = "vlk01_election_" + std::to_string(Clock::now().time_since_epoch().count());
+    const std::string uri = redis_test::Uri(
+        "test_redis_user:test_redis_password",
+        redis_test::kCoordinationDb,
+        "timeout_ms=1000&retry_count=3&client_min_pool_size=1&client_max_pool_size=2&cluster_name=" + cluster_name);
+    const std::string lock_key = "dead_holder_failover";
+    const std::string dead_holder = "dead_node";
+    const std::string follower = "follower_node";
+    constexpr int64_t kLeaseMs = 250;
+    constexpr int64_t kLoopIntervalMs = 20;
+
+    auto dead_holder_backend_unique = CoordinationBackendFactory::CreateAndInitCoordinationBackend(uri);
+    auto follower_backend_unique = CoordinationBackendFactory::CreateAndInitCoordinationBackend(uri);
+    ASSERT_NE(nullptr, dead_holder_backend_unique);
+    ASSERT_NE(nullptr, follower_backend_unique);
+    std::shared_ptr<CoordinationBackend> dead_holder_backend(std::move(dead_holder_backend_unique));
+    std::shared_ptr<CoordinationBackend> follower_backend(std::move(follower_backend_unique));
+
+    const auto failover_start = Clock::now();
+    ASSERT_EQ(EC_OK, dead_holder_backend->TryLock(lock_key, dead_holder, kLeaseMs));
+    ASSERT_EQ(EC_EXIST, follower_backend->TryLock(lock_key, follower, kLeaseMs));
+
+    struct PromotionState {
+        std::mutex promotion_mutex;
+        std::condition_variable promotion_cv;
+        bool promoted = false;
+        Clock::time_point first_promotion_time;
+    };
+    auto promotion = std::make_shared<PromotionState>();
+    LeaderElector elector(follower_backend, lock_key, follower, kLeaseMs, kLoopIntervalMs);
+    elector.SetBecomeLeaderHandler([promotion]() {
+        std::lock_guard<std::mutex> lock(promotion->promotion_mutex);
+        if (promotion->promoted) {
+            return;
+        }
+        promotion->first_promotion_time = Clock::now();
+        promotion->promoted = true;
+        promotion->promotion_cv.notify_one();
+    });
+    elector.SetNoLongerLeaderHandler([]() {});
+    ASSERT_TRUE(elector.Start());
+
+    const auto deadline = failover_start + std::chrono::milliseconds(900);
+    std::unique_lock<std::mutex> lock(promotion->promotion_mutex);
+    const bool promoted_before_deadline =
+        promotion->promotion_cv.wait_until(lock, deadline, [promotion]() { return promotion->promoted; });
+    ASSERT_TRUE(promoted_before_deadline);
+    const auto first_promotion_time = promotion->first_promotion_time;
+    lock.unlock();
+
+    const auto promotion_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(first_promotion_time - failover_start).count();
+    EXPECT_LT(promotion_ms, 1000);
+    EXPECT_TRUE(elector.IsLeader());
+
+    elector.Stop();
+    std::string current_holder;
+    int64_t expire_time_ms = 0;
+    EXPECT_EQ(EC_NOENT, follower_backend->GetLockHolder(lock_key, current_holder, expire_time_ms));
 }
 
 TEST(CoordinationRedisDbIsolationTest, SameKeysAreIsolatedByDb) {

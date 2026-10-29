@@ -129,6 +129,7 @@ cc_test(
         "//kv_cache_manager/common/test:redis_test_environment",
         "//kv_cache_manager/common:unittest",
         "//kv_cache_manager/config:coordination_backend",
+        "//kv_cache_manager/config:leader_elector_base",
     ],
 )
 
