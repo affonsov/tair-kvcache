@@ -47,6 +47,22 @@ cc_library(
 )
 
 cc_library(
+    name = "valkey_sdk",
+    srcs = [
+        "deadline_util.h",
+        "valkey_sdk.cc",
+    ],
+    hdrs = ["valkey_sdk.h"],
+    deps = [
+        ":sdk_common",
+        "//kv_cache_manager/common:client_pool",
+        "//kv_cache_manager/common:redis_client",
+        "//kv_cache_manager/data_storage:common_define",
+        "//kv_cache_manager/data_storage:valkey_uri_util",
+    ],
+)
+
+cc_library(
     name = "sdk",
     srcs = [
         "local_file_sdk.cc",

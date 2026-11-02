@@ -13,6 +13,7 @@ enum class SdkType : uint8_t {
     MOONCAKE = 1,
     TAIR_MEMPOOL = 2,
     LOCAL_FILE = 3,
+    VALKEY = 4,
     SDK_TYPE_MAX = 255,
 };
 
