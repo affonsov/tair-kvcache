@@ -114,8 +114,45 @@ TEST_F(SdkBackendConfigTest, TestSdkWrapperConfigGetSdkConfig) {
     auto nfs_config = sdk_wrapper_config.GetSdkBackendConfig(DataStorageType::DATA_STORAGE_TYPE_NFS);
     ASSERT_NE(nfs_config, nullptr);
 
+    auto valkey_config = sdk_wrapper_config.GetSdkBackendConfig(DataStorageType::DATA_STORAGE_TYPE_VALKEY);
+    ASSERT_NE(valkey_config, nullptr);
+    EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_VALKEY, valkey_config->type());
+    EXPECT_TRUE(valkey_config->Validate());
+
     auto unknown_config = sdk_wrapper_config.GetSdkBackendConfig(DataStorageType::DATA_STORAGE_TYPE_UNKNOWN);
     ASSERT_EQ(unknown_config, nullptr);
+}
+
+TEST_F(SdkBackendConfigTest, TestSdkWrapperConfigParsesValkeyAndKeepsUnknownUnsupported) {
+    SdkWrapperConfig sdk_wrapper_config;
+    ASSERT_TRUE(sdk_wrapper_config.FromJsonString(R"({
+        "thread_num": 8,
+        "queue_size": 2000,
+        "sdk_backend_configs": [{
+            "type": "valkey",
+            "sdk_log_file_path": "logs/valkey_client.log",
+            "sdk_log_level": "INFO",
+            "spec_byte_sizes_per_block": {}
+        }, {
+            "type": "future_storage",
+            "sdk_log_file_path": "logs/future.log",
+            "sdk_log_level": "INFO",
+            "spec_byte_sizes_per_block": {}
+        }],
+        "timeout_config": {"put_timeout_ms": 15000, "get_timeout_ms": 15000}
+    })"));
+
+    const auto valkey_config = sdk_wrapper_config.GetSdkBackendConfig(DataStorageType::DATA_STORAGE_TYPE_VALKEY);
+    ASSERT_NE(nullptr, valkey_config);
+    EXPECT_NE(nullptr, std::dynamic_pointer_cast<ValkeySdkConfig>(valkey_config));
+    EXPECT_EQ("logs/valkey_client.log", valkey_config->sdk_log_file_path());
+    EXPECT_TRUE(valkey_config->Validate());
+    EXPECT_EQ(nullptr, sdk_wrapper_config.GetSdkBackendConfig(DataStorageType::DATA_STORAGE_TYPE_UNKNOWN));
+    EXPECT_EQ(6u, sdk_wrapper_config.sdk_backend_configs_map().size());
+
+    SdkWrapperConfig restored;
+    ASSERT_TRUE(restored.FromJsonString(sdk_wrapper_config.ToJsonString()));
+    EXPECT_EQ(sdk_wrapper_config, restored);
 }
 
 TEST_F(SdkBackendConfigTest, TestSdkWrapperConfigParsesTairMempoolSsd) {

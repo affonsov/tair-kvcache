@@ -7,6 +7,7 @@
 #ifdef ENABLE_MOONCAKE
 #include "kv_cache_manager/client/src/internal/sdk/mooncake_sdk.h"
 #endif
+#include "kv_cache_manager/client/src/internal/sdk/valkey_sdk.h"
 #ifdef ENABLE_TAIR_MEMPOOL
 #include "stub_source/kv_cache_manager/client/src/internal/sdk/tair_mempool_sdk.h"
 #endif
@@ -67,6 +68,9 @@ std::shared_ptr<SdkInterface> SdkFactory::CreateSdkInstance(const DataStorageTyp
 #endif
     case DataStorageType::DATA_STORAGE_TYPE_NFS:
         sdk = std::make_shared<LocalFileSdk>();
+        break;
+    case DataStorageType::DATA_STORAGE_TYPE_VALKEY:
+        sdk = std::make_shared<ValkeySdk>();
         break;
     default:
         return nullptr;

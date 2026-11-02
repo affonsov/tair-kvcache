@@ -24,6 +24,7 @@
 #include "kv_cache_manager/data_storage/hf3fs_backend.h"
 #include "kv_cache_manager/data_storage/nfs_backend.h"
 #include "kv_cache_manager/data_storage/storage_config.h"
+#include "kv_cache_manager/data_storage/valkey_backend.h"
 #include "kv_cache_manager/manager/data_storage_selector.h"
 #include "kv_cache_manager/meta/meta_indexer.h"
 #include "kv_cache_manager/meta/meta_indexer_manager.h"
@@ -668,6 +669,31 @@ TEST_F(DataStorageSelectorTest, TestEventReportUsageDoesNotConsumeGroupQuota) {
         request_context_.get(), "default_test_group", {"3fs_storage_01"});
     ASSERT_EQ(1u, admissions.size());
     EXPECT_EQ(StorageTargetAdmissionStatus::kGroupQuotaExceeded, admissions[0].status);
+}
+
+TEST_F(DataStorageSelectorTest, TestValkeyUsesDefaultEligibilityAndHonorsZeroQuota) {
+    const auto valkey = std::make_shared<ValkeyDataStorageBackend>(metrics_registry_);
+    valkey->config_ = StorageConfig(DataStorageType::DATA_STORAGE_TYPE_VALKEY, "valkey_storage_00", nullptr);
+    valkey->is_open_ = true;
+    valkey->is_available_ = true;
+    avail_backends_g = {valkey};
+
+    instance_group_g->set_storage_candidates({"valkey_storage_00"});
+    instance_group_g->cache_config_->set_cache_prefer_strategy(CachePreferStrategy::CPS_UNSPECIFIED);
+    InstanceGroupQuota quota;
+    quota.set_capacity(1024);
+    instance_group_g->set_quota(quota);
+
+    auto result =
+        data_storage_selector_->SelectCacheWriteDataStorageBackend(request_context_.get(), "default_test_group");
+    ASSERT_EQ(ErrorCode::EC_OK, result.ec);
+    EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_VALKEY, result.type);
+    EXPECT_EQ("valkey_storage_00", result.name);
+
+    quota.set_quota_config({QuotaConfig(0, DataStorageType::DATA_STORAGE_TYPE_VALKEY)});
+    instance_group_g->set_quota(quota);
+    result = data_storage_selector_->SelectCacheWriteDataStorageBackend(request_context_.get(), "default_test_group");
+    EXPECT_NE(ErrorCode::EC_OK, result.ec);
 }
 
 TEST_F(DataStorageSelectorTest, TestExplicitWriteTargetAdmissionChecksAvailabilityAndQuota) {
