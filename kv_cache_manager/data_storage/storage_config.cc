@@ -1,9 +1,70 @@
 #include "kv_cache_manager/data_storage/storage_config.h"
 
+#include <cctype>
+#include <charconv>
 #include <limits>
 #include <sstream>
+#include <string_view>
 
 namespace kv_cache_manager {
+namespace {
+
+bool IsValidValkeyEndpoint(const std::string &endpoint) {
+    constexpr std::string_view kPreferredScheme = "valkey://";
+    constexpr std::string_view kCompatibilityScheme = "redis://";
+    std::string_view scheme;
+    if (endpoint.compare(0, kPreferredScheme.size(), kPreferredScheme) == 0) {
+        scheme = kPreferredScheme;
+    } else if (endpoint.compare(0, kCompatibilityScheme.size(), kCompatibilityScheme) == 0) {
+        scheme = kCompatibilityScheme;
+    } else {
+        return false;
+    }
+
+    const std::string_view remainder(endpoint.data() + scheme.size(), endpoint.size() - scheme.size());
+    const size_t slash = remainder.find('/');
+    if (slash == std::string_view::npos) {
+        return false;
+    }
+    const std::string_view authority = remainder.substr(0, slash);
+    const size_t colon = authority.rfind(':');
+    if (colon == std::string_view::npos || colon == 0 || colon + 1 == authority.size() ||
+        authority.find(':') != colon || authority.find('@') != std::string_view::npos) {
+        return false;
+    }
+
+    const std::string_view host = authority.substr(0, colon);
+    for (const unsigned char ch : host) {
+        if (!std::isalnum(ch) && ch != '.' && ch != '-' && ch != '_') {
+            return false;
+        }
+    }
+
+    uint32_t port = 0;
+    const std::string_view port_string = authority.substr(colon + 1);
+    const auto [port_end, port_ec] = std::from_chars(port_string.data(), port_string.data() + port_string.size(), port);
+    if (port_ec != std::errc{} || port_end != port_string.data() + port_string.size() || port == 0 || port > 65535) {
+        return false;
+    }
+
+    const std::string_view path_and_query = remainder.substr(slash);
+    if (path_and_query == "/") {
+        return true;
+    }
+    constexpr std::string_view kDbPrefix = "/?db=";
+    if (path_and_query.compare(0, kDbPrefix.size(), kDbPrefix) != 0) {
+        return false;
+    }
+    const std::string_view db_string = path_and_query.substr(kDbPrefix.size());
+    if (db_string.empty()) {
+        return false;
+    }
+    int64_t db = 0;
+    const auto [db_end, db_ec] = std::from_chars(db_string.data(), db_string.data() + db_string.size(), db);
+    return db_ec == std::errc{} && db_end == db_string.data() + db_string.size() && db >= 0;
+}
+
+} // namespace
 
 std::string ThreeFSStorageSpec::ToString() const {
     std::ostringstream oss;
@@ -179,6 +240,8 @@ std::string ToString(const DataStorageType &type) {
         return "event_report_l1p5";
     case DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2:
         return "event_report_l2";
+    case DataStorageType::DATA_STORAGE_TYPE_VALKEY:
+        return "valkey";
     default:
         return "unrecognized";
     }
@@ -203,6 +266,8 @@ DataStorageType ToDataStorageType(const std::string &type) {
         return DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5;
     } else if (type == "event_report_l2") {
         return DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2;
+    } else if (type == "valkey") {
+        return DataStorageType::DATA_STORAGE_TYPE_VALKEY;
     } else {
         return DataStorageType::DATA_STORAGE_TYPE_UNKNOWN;
     }
@@ -355,6 +420,28 @@ void DummyStorageSpec::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> 
     Put(writer, "key_count_per_file", key_count_per_file_);
 }
 
+bool ValkeyStorageSpec::FromRapidValue(const rapidjson::Value &rapid_value) {
+    if (!rapid_value.IsObject() || rapid_value.MemberCount() != 1 || !rapid_value.HasMember("endpoint")) {
+        return false;
+    }
+    KVCM_JSON_GET_MACRO(rapid_value, "endpoint", endpoint_);
+    return true;
+}
+
+void ValkeyStorageSpec::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept {
+    Put(writer, "endpoint", endpoint_);
+}
+
+bool ValkeyStorageSpec::ValidateRequiredFields(std::string &invalid_fields) const {
+    if (IsValidValkeyEndpoint(endpoint_)) {
+        return true;
+    }
+    invalid_fields += "{ValkeyStorageSpec: {endpoint}}";
+    return false;
+}
+
+std::string ValkeyStorageSpec::ToString() const { return "endpoint: [redacted]"; }
+
 bool StorageConfig::FromRapidValue(const rapidjson::Value &rapid_value) {
     std::string type_str;
     KVCM_JSON_GET_MACRO(rapid_value, "type", type_str);
@@ -383,6 +470,10 @@ bool StorageConfig::FromRapidValue(const rapidjson::Value &rapid_value) {
         storage_spec_ = tmp;
     } else if (type_ == DataStorageType::DATA_STORAGE_TYPE_DUMMY) {
         auto tmp = std::make_shared<DummyStorageSpec>();
+    } else if (type_ == DataStorageType::DATA_STORAGE_TYPE_VALKEY) {
+        auto tmp = std::make_shared<ValkeyStorageSpec>();
+        KVCM_JSON_GET_MACRO(rapid_value, "storage_spec", tmp);
+        storage_spec_ = tmp;
     } else if (IsEventReportStorageType(type_)) {
         auto tmp = std::make_shared<EventReportStorageSpec>();
         KVCM_JSON_GET_MACRO(rapid_value, "storage_spec", tmp);
@@ -410,6 +501,11 @@ bool StorageConfig::ValidateRequiredFields(std::string &invalid_fields) const {
     if (type_ == DataStorageType::DATA_STORAGE_TYPE_UNKNOWN || storage_spec_ == nullptr) {
         valid = false;
         local_invalid_fields += "{storage_spec}";
+    }
+    const bool has_valkey_spec = std::dynamic_pointer_cast<ValkeyStorageSpec>(storage_spec_) != nullptr;
+    if ((type_ == DataStorageType::DATA_STORAGE_TYPE_VALKEY) != has_valkey_spec) {
+        valid = false;
+        local_invalid_fields += "{valkey_type_spec_mismatch}";
     }
     if (storage_spec_ && !storage_spec_->ValidateRequiredFields(local_invalid_fields)) {
         valid = false;

@@ -300,3 +300,117 @@ TEST_F(StorageConfigTest, TestTairMempoolRejectsNonPositiveHealthTimeout) {
         EXPECT_NE(std::string::npos, invalid_fields.find("health_check_timeout"));
     }
 }
+
+TEST_F(StorageConfigTest, TestValkeyTypeConversionsPreserveExistingValues) {
+    EXPECT_EQ(0, static_cast<int>(DataStorageType::DATA_STORAGE_TYPE_UNKNOWN));
+    EXPECT_EQ(1, static_cast<int>(DataStorageType::DATA_STORAGE_TYPE_HF3FS));
+    EXPECT_EQ(2, static_cast<int>(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE));
+    EXPECT_EQ(3, static_cast<int>(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL));
+    EXPECT_EQ(4, static_cast<int>(DataStorageType::DATA_STORAGE_TYPE_NFS));
+    EXPECT_EQ(5, static_cast<int>(DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS));
+    EXPECT_EQ(6, static_cast<int>(DataStorageType::DATA_STORAGE_TYPE_DUMMY));
+    EXPECT_EQ(7, static_cast<int>(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L1P5));
+    EXPECT_EQ(8, static_cast<int>(DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2));
+    EXPECT_EQ(9, static_cast<int>(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD));
+    EXPECT_EQ(10, static_cast<int>(DataStorageType::DATA_STORAGE_TYPE_VALKEY));
+    EXPECT_EQ("valkey", ToString(DataStorageType::DATA_STORAGE_TYPE_VALKEY));
+    EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_VALKEY, ToDataStorageType("valkey"));
+    EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_VALKEY, ToBaseType(DataStorageType::DATA_STORAGE_TYPE_VALKEY));
+}
+
+TEST_F(StorageConfigTest, TestValkeyEndpointOnlyJsonRoundTrip) {
+    ValkeyStorageSpec spec;
+    spec.set_endpoint("valkey://127.0.0.1:6379/?db=11");
+    EXPECT_EQ(R"({"endpoint":"valkey://127.0.0.1:6379/?db=11"})", spec.ToJsonString());
+    EXPECT_EQ(std::string::npos, spec.ToString().find("127.0.0.1"));
+
+    auto spec_ptr = std::make_shared<ValkeyStorageSpec>(spec);
+    StorageConfig config(DataStorageType::DATA_STORAGE_TYPE_VALKEY, "valkey-primary", spec_ptr);
+    std::string invalid_fields;
+    ASSERT_TRUE(config.ValidateRequiredFields(invalid_fields)) << invalid_fields;
+
+    const std::string json = config.ToJsonString();
+    EXPECT_EQ(
+        R"({"type":"valkey","is_available":true,"global_unique_name":"valkey-primary","storage_spec":{"endpoint":"valkey://127.0.0.1:6379/?db=11"}})",
+        json);
+    StorageConfig restored;
+    ASSERT_TRUE(restored.FromJsonString(json));
+    EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_VALKEY, restored.type());
+    const auto restored_spec = std::dynamic_pointer_cast<ValkeyStorageSpec>(restored.storage_spec());
+    ASSERT_NE(nullptr, restored_spec);
+    EXPECT_EQ(spec.endpoint(), restored_spec->endpoint());
+
+    ValkeyStorageSpec compatibility_alias;
+    ASSERT_TRUE(compatibility_alias.FromJsonString(R"({"endpoint":"redis://127.0.0.1:6379/?db=11"})"));
+    EXPECT_EQ("redis://127.0.0.1:6379/?db=11", compatibility_alias.endpoint());
+    EXPECT_EQ(R"({"endpoint":"redis://127.0.0.1:6379/?db=11"})", compatibility_alias.ToJsonString());
+}
+
+TEST_F(StorageConfigTest, TestValkeyRequiredFieldAndTypePairing) {
+    StorageConfig missing_spec;
+    EXPECT_FALSE(missing_spec.FromJsonString(
+        R"({"type":"valkey","is_available":true,"global_unique_name":"valkey-primary","storage_spec":{}})"));
+
+    StorageConfig extra_spec_field;
+    EXPECT_FALSE(extra_spec_field.FromJsonString(
+        R"({"type":"valkey","is_available":true,"global_unique_name":"valkey-primary","storage_spec":{"endpoint":"redis://localhost:6379/","database":11}})"));
+
+    StorageConfig wrong_field_type;
+    EXPECT_FALSE(wrong_field_type.FromJsonString(
+        R"({"type":"valkey","is_available":true,"global_unique_name":"valkey-primary","storage_spec":{"endpoint":1}})"));
+
+    auto valkey_spec = std::make_shared<ValkeyStorageSpec>();
+    valkey_spec->set_endpoint("redis://localhost:6379/");
+    StorageConfig wrong_type(DataStorageType::DATA_STORAGE_TYPE_NFS, "valkey-primary", valkey_spec);
+    std::string invalid_fields;
+    EXPECT_FALSE(wrong_type.ValidateRequiredFields(invalid_fields));
+    EXPECT_NE(std::string::npos, invalid_fields.find("valkey_type_spec_mismatch"));
+
+    auto nfs_spec = std::make_shared<NfsStorageSpec>();
+    nfs_spec->set_root_path("/tmp");
+    StorageConfig wrong_spec(DataStorageType::DATA_STORAGE_TYPE_VALKEY, "valkey-primary", nfs_spec);
+    invalid_fields.clear();
+    EXPECT_FALSE(wrong_spec.ValidateRequiredFields(invalid_fields));
+    EXPECT_NE(std::string::npos, invalid_fields.find("valkey_type_spec_mismatch"));
+}
+
+TEST_F(StorageConfigTest, TestValkeyEndpointValidation) {
+    for (const std::string &endpoint : {
+             "valkey://localhost:6379/",
+             "valkey://127.0.0.1:6379/?db=0",
+             "valkey://cache.internal:16379/?db=11",
+             "redis://cache.internal:16379/?db=11",
+         }) {
+        ValkeyStorageSpec spec;
+        spec.set_endpoint(endpoint);
+        std::string invalid_fields;
+        EXPECT_TRUE(spec.ValidateRequiredFields(invalid_fields)) << endpoint << ": " << invalid_fields;
+    }
+
+    for (const std::string &endpoint : {
+             "",
+             "valkeys://localhost:6379/",
+             "rediss://localhost:6379/",
+             "redis://user:password@localhost:6379/",
+             "redis://:6379/",
+             "redis://bad host:6379/",
+             "redis://localhost/",
+             "redis://localhost:0/",
+             "redis://localhost:65536/",
+             "redis://localhost:not-a-port/",
+             "redis://localhost:6379",
+             "redis://localhost:6379/cache",
+             "redis://localhost:6379/?db=",
+             "redis://localhost:6379/?db=-1",
+             "redis://localhost:6379/?db=abc",
+             "redis://localhost:6379/?db=1&timeout_ms=5",
+             "redis://localhost:6379/?timeout_ms=5",
+             "redis://localhost:6379/?db=1&db=2",
+         }) {
+        ValkeyStorageSpec spec;
+        spec.set_endpoint(endpoint);
+        std::string invalid_fields;
+        EXPECT_FALSE(spec.ValidateRequiredFields(invalid_fields)) << endpoint;
+        EXPECT_NE(std::string::npos, invalid_fields.find("endpoint")) << endpoint;
+    }
+}
