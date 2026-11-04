@@ -1,7 +1,9 @@
 #include "kv_cache_manager/common/redis_client.h"
 
 #include <cassert>
+#include <cstddef>
 #include <cstring>
+#include <limits>
 #include <unordered_set>
 
 #include "kv_cache_manager/common/logger.h"
@@ -16,6 +18,52 @@ namespace kv_cache_manager {
 #define KVCM_REDIS_LOG_ERROR(format, ...)                                                                              \
     KVCM_LOG_ERROR(                                                                                                    \
         "redis client addr[%s:%ld] user[%s] " format, host_.c_str(), port_, user_info_.c_str(), ##__VA_ARGS__)
+
+namespace {
+
+// Cap per-pipeline hiredis command/reply bookkeeping while retaining useful
+// batching for Valkey block transfers.
+constexpr std::size_t kStringPipelineMaxCommandCount = 64;
+// Cap copied raw request arguments at 1 MiB per pipeline. This counts SET plus
+// key/value bytes or GET plus key bytes; RESP framing is not copied here.
+constexpr std::size_t kStringPipelineMaxRequestPayloadBytes = 1024 * 1024;
+
+std::size_t SaturatingAdd(const std::size_t lhs, const std::size_t rhs) noexcept {
+    const auto max = std::numeric_limits<std::size_t>::max();
+    return rhs > max - lhs ? max : lhs + rhs;
+}
+
+std::size_t SetStringRequestPayloadBytes(const std::string &key, const std::string &value) noexcept {
+    return SaturatingAdd(SaturatingAdd(sizeof("SET") - 1, key.size()), value.size());
+}
+
+std::size_t GetStringRequestPayloadBytes(const std::string &key) noexcept {
+    return SaturatingAdd(sizeof("GET") - 1, key.size());
+}
+
+template <typename RequestPayloadBytes>
+std::size_t StringPipelineChunkEnd(const std::size_t item_count,
+                                   const std::size_t begin,
+                                   RequestPayloadBytes request_payload_bytes) {
+    std::size_t end = begin;
+    std::size_t chunk_payload_bytes = 0;
+    while (end < item_count && end - begin < kStringPipelineMaxCommandCount) {
+        const std::size_t item_payload_bytes = request_payload_bytes(end);
+        if (end != begin && (chunk_payload_bytes > kStringPipelineMaxRequestPayloadBytes ||
+                             item_payload_bytes > kStringPipelineMaxRequestPayloadBytes - chunk_payload_bytes)) {
+            break;
+        }
+        chunk_payload_bytes = SaturatingAdd(chunk_payload_bytes, item_payload_bytes);
+        ++end;
+        if (chunk_payload_bytes > kStringPipelineMaxRequestPayloadBytes) {
+            // A valid oversized item runs alone instead of being rejected.
+            break;
+        }
+    }
+    return end;
+}
+
+} // namespace
 
 RedisClient::RedisClient(const StandardUri &storage_uri)
     : user_info_(storage_uri.GetUserInfo()), host_(storage_uri.GetHostName()), port_(storage_uri.GetPort()) {
@@ -280,30 +328,37 @@ std::vector<ErrorCode> RedisClient::SetStrings(const std::vector<std::string> &k
         return {};
     }
 
-    std::vector<CmdArgs> set_cmds;
-    set_cmds.reserve(keys.size());
-    for (size_t i = 0; i < keys.size(); ++i) {
-        set_cmds.push_back({"SET", keys[i], values[i]});
-    }
+    std::vector<ErrorCode> ec_per_key(keys.size(), EC_ERROR);
+    for (std::size_t chunk_begin = 0; chunk_begin < keys.size();) {
+        const std::size_t chunk_end = StringPipelineChunkEnd(keys.size(), chunk_begin, [&](const std::size_t index) {
+            return SetStringRequestPayloadBytes(keys[index], values[index]);
+        });
 
-    std::vector<ReplyUPtr> set_replies = CommandPipeline(set_cmds);
-    if (set_replies.size() != keys.size()) {
-        KVCM_REDIS_LOG_ERROR("redis set strings fail, pipeline keys.size[%lu] != set_replies.size[%lu]",
-                             keys.size(),
-                             set_replies.size());
-        return std::vector<ErrorCode>(keys.size(), EC_ERROR);
-    }
-
-    std::vector<ErrorCode> ec_per_key;
-    ec_per_key.reserve(keys.size());
-    for (const ReplyUPtr &set_reply : set_replies) {
-        const redisReply *reply = set_reply.get();
-        if (!IsReplyOk(reply) || reply->type != REDIS_REPLY_STATUS || !reply->str || reply->len != 2 ||
-            memcmp(reply->str, "OK", 2) != 0) {
-            ec_per_key.emplace_back(EC_ERROR);
-        } else {
-            ec_per_key.emplace_back(EC_OK);
+        std::vector<CmdArgs> set_cmds;
+        set_cmds.reserve(chunk_end - chunk_begin);
+        for (std::size_t i = chunk_begin; i < chunk_end; ++i) {
+            set_cmds.push_back({"SET", keys[i], values[i]});
         }
+
+        std::vector<ReplyUPtr> set_replies;
+        const ErrorCode pipeline_ec = CommandPipeline(set_cmds, set_replies);
+        if (pipeline_ec != EC_OK || set_replies.size() != set_cmds.size()) {
+            KVCM_REDIS_LOG_ERROR("redis set strings fail, chunk begin[%zu] commands[%zu] replies[%zu] pipeline_ec[%d]",
+                                 chunk_begin,
+                                 set_cmds.size(),
+                                 set_replies.size(),
+                                 static_cast<int>(pipeline_ec));
+            break;
+        }
+
+        for (std::size_t i = 0; i < set_replies.size(); ++i) {
+            const redisReply *reply = set_replies[i].get();
+            if (IsReplyOk(reply) && reply->type == REDIS_REPLY_STATUS && reply->str && reply->len == 2 &&
+                memcmp(reply->str, "OK", 2) == 0) {
+                ec_per_key[chunk_begin + i] = EC_OK;
+            }
+        }
+        chunk_begin = chunk_end;
     }
     return ec_per_key;
 }
@@ -315,34 +370,43 @@ std::vector<ErrorCode> RedisClient::GetStrings(const std::vector<std::string> &k
         return {};
     }
 
-    std::vector<CmdArgs> get_cmds;
-    get_cmds.reserve(keys.size());
-    for (const std::string &key : keys) {
-        get_cmds.push_back({"GET", key});
-    }
+    std::vector<ErrorCode> ec_per_key(keys.size(), EC_ERROR);
+    for (std::size_t chunk_begin = 0; chunk_begin < keys.size();) {
+        const std::size_t chunk_end = StringPipelineChunkEnd(keys.size(), chunk_begin, [&](const std::size_t index) {
+            return GetStringRequestPayloadBytes(keys[index]);
+        });
 
-    std::vector<ReplyUPtr> get_replies = CommandPipeline(get_cmds);
-    if (get_replies.size() != keys.size()) {
-        KVCM_REDIS_LOG_ERROR("redis get strings fail, pipeline keys.size[%lu] != get_replies.size[%lu]",
-                             keys.size(),
-                             get_replies.size());
-        return std::vector<ErrorCode>(keys.size(), EC_ERROR);
-    }
-
-    std::vector<ErrorCode> ec_per_key;
-    ec_per_key.reserve(keys.size());
-    for (size_t i = 0; i < keys.size(); ++i) {
-        const redisReply *reply = get_replies[i].get();
-        if (!IsReplyOk(reply)) {
-            ec_per_key.emplace_back(EC_ERROR);
-        } else if (reply->type == REDIS_REPLY_NIL) {
-            ec_per_key.emplace_back(EC_NOENT);
-        } else if (reply->type != REDIS_REPLY_STRING || !reply->str) {
-            ec_per_key.emplace_back(EC_ERROR);
-        } else {
-            out_values[i].assign(reply->str, reply->len);
-            ec_per_key.emplace_back(EC_OK);
+        std::vector<CmdArgs> get_cmds;
+        get_cmds.reserve(chunk_end - chunk_begin);
+        for (std::size_t i = chunk_begin; i < chunk_end; ++i) {
+            get_cmds.push_back({"GET", keys[i]});
         }
+
+        std::vector<ReplyUPtr> get_replies;
+        const ErrorCode pipeline_ec = CommandPipeline(get_cmds, get_replies);
+        if (pipeline_ec != EC_OK || get_replies.size() != get_cmds.size()) {
+            KVCM_REDIS_LOG_ERROR("redis get strings fail, chunk begin[%zu] commands[%zu] replies[%zu] pipeline_ec[%d]",
+                                 chunk_begin,
+                                 get_cmds.size(),
+                                 get_replies.size(),
+                                 static_cast<int>(pipeline_ec));
+            break;
+        }
+
+        for (std::size_t i = 0; i < get_replies.size(); ++i) {
+            const redisReply *reply = get_replies[i].get();
+            if (!IsReplyOk(reply)) {
+                continue;
+            }
+            const std::size_t result_index = chunk_begin + i;
+            if (reply->type == REDIS_REPLY_NIL) {
+                ec_per_key[result_index] = EC_NOENT;
+            } else if (reply->type == REDIS_REPLY_STRING && reply->str) {
+                out_values[result_index].assign(reply->str, reply->len);
+                ec_per_key[result_index] = EC_OK;
+            }
+        }
+        chunk_begin = chunk_end;
     }
     return ec_per_key;
 }
