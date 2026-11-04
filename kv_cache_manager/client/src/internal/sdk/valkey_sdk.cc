@@ -8,9 +8,41 @@
 #include <utility>
 
 #include "kv_cache_manager/client/src/internal/sdk/deadline_util.h"
+#include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/data_storage/valkey_uri_util.h"
 
 namespace kv_cache_manager {
+namespace {
+
+void LogSoftTimeout(const char *operation,
+                    const char *stage,
+                    std::size_t block_count,
+                    const std::string &storage_identity,
+                    int configured_budget_ms,
+                    int64_t start_ms) {
+    KVCM_LOG_WARN("valkey sdk soft timeout: operation=%s stage=%s block_count=%zu storage_identity=%s "
+                  "configured_budget_ms=%d elapsed_ms=%lld",
+                  operation,
+                  stage,
+                  block_count,
+                  storage_identity.c_str(),
+                  configured_budget_ms,
+                  static_cast<long long>(SteadyClockMs() - start_ms));
+}
+
+void LogLatePutSuccess(std::size_t block_count,
+                       const std::string &storage_identity,
+                       int configured_budget_ms,
+                       int64_t start_ms) {
+    KVCM_LOG_WARN("valkey sdk late completion: operation=put stage=redis_io block_count=%zu storage_identity=%s "
+                  "configured_budget_ms=%d elapsed_ms=%lld result=success",
+                  block_count,
+                  storage_identity.c_str(),
+                  configured_budget_ms,
+                  static_cast<long long>(SteadyClockMs() - start_ms));
+}
+
+} // namespace
 
 ClientErrorCode ValkeySdk::Init(const std::shared_ptr<SdkBackendConfig> &sdk_backend_config,
                                 const std::shared_ptr<StorageConfig> &storage_config) {
@@ -72,21 +104,25 @@ ClientErrorCode ValkeySdk::Get(const std::vector<DataStorageUri> &remote_uris, c
     if (!get_client_pool_) {
         return ER_SDKINIT_ERROR;
     }
-    const int64_t deadline_ms = SteadyClockMs() + timeout_config_.get_timeout_ms();
+    const int configured_budget_ms = timeout_config_.get_timeout_ms();
+    const int64_t start_ms = SteadyClockMs();
+    const int64_t deadline_ms = start_ms + configured_budget_ms;
 
     std::vector<std::string> redis_keys;
     std::vector<std::size_t> expected_sizes;
-    ClientErrorCode ec = Preflight(remote_uris, local_buffers, storage_identity_, redis_keys, expected_sizes);
+    ClientErrorCode ec = Preflight(remote_uris, local_buffers, storage_identity_, true, redis_keys, expected_sizes);
     if (ec != ER_OK) {
         return ec;
     }
     const auto remaining_ms = RemainingMs(deadline_ms);
     if (!remaining_ms) {
+        LogSoftTimeout("get", "pre_acquire", remote_uris.size(), storage_identity_, configured_budget_ms, start_ms);
         return ER_SDK_TIMEOUT;
     }
 
     auto client = get_client_pool_->AcquireClient(*remaining_ms);
     if (!client) {
+        LogSoftTimeout("get", "pool_acquire", remote_uris.size(), storage_identity_, configured_budget_ms, start_ms);
         return ER_SDK_TIMEOUT;
     }
 
@@ -95,13 +131,26 @@ ClientErrorCode ValkeySdk::Get(const std::vector<DataStorageUri> &remote_uris, c
     try {
         results = GetStrings(*client, redis_keys, values);
     } catch (const std::bad_alloc &) {
+        if (DeadlineExpired(deadline_ms)) {
+            LogSoftTimeout("get", "redis_io", remote_uris.size(), storage_identity_, configured_budget_ms, start_ms);
+            return ER_SDK_TIMEOUT;
+        }
         return ER_INVALID_LOCAL_BUFFERS;
     } catch (const std::length_error &) {
+        if (DeadlineExpired(deadline_ms)) {
+            LogSoftTimeout("get", "redis_io", remote_uris.size(), storage_identity_, configured_budget_ms, start_ms);
+            return ER_SDK_TIMEOUT;
+        }
         return ER_INVALID_LOCAL_BUFFERS;
     } catch (...) {
+        if (DeadlineExpired(deadline_ms)) {
+            LogSoftTimeout("get", "redis_io", remote_uris.size(), storage_identity_, configured_budget_ms, start_ms);
+            return ER_SDK_TIMEOUT;
+        }
         return ER_SDKREAD_ERROR;
     }
     if (DeadlineExpired(deadline_ms)) {
+        LogSoftTimeout("get", "redis_io", remote_uris.size(), storage_identity_, configured_budget_ms, start_ms);
         return ER_SDK_TIMEOUT;
     }
     if (results.size() != remote_uris.size() || values.size() != remote_uris.size()) {
@@ -125,12 +174,15 @@ ClientErrorCode ValkeySdk::Get(const std::vector<DataStorageUri> &remote_uris, c
             if (iov.size == 0) {
                 continue;
             }
-            std::memcpy(iov.base, values[block_index].data() + offset, iov.size);
+            if (!iov.ignore) {
+                std::memcpy(iov.base, values[block_index].data() + offset, iov.size);
+            }
             offset += iov.size;
         }
     }
 
     if (has_timeout) {
+        LogSoftTimeout("get", "redis_result", remote_uris.size(), storage_identity_, configured_budget_ms, start_ms);
         return ER_SDK_TIMEOUT;
     }
     return has_error ? ER_SDKREAD_ERROR : ER_OK;
@@ -150,11 +202,13 @@ ClientErrorCode ValkeySdk::Put(const std::vector<DataStorageUri> &remote_uris,
     if (!put_client_pool_) {
         return ER_SDKINIT_ERROR;
     }
-    const int64_t deadline_ms = SteadyClockMs() + timeout_config_.put_timeout_ms();
+    const int configured_budget_ms = timeout_config_.put_timeout_ms();
+    const int64_t start_ms = SteadyClockMs();
+    const int64_t deadline_ms = start_ms + configured_budget_ms;
 
     std::vector<std::string> redis_keys;
     std::vector<std::size_t> expected_sizes;
-    ClientErrorCode ec = Preflight(remote_uris, local_buffers, storage_identity_, redis_keys, expected_sizes);
+    ClientErrorCode ec = Preflight(remote_uris, local_buffers, storage_identity_, false, redis_keys, expected_sizes);
     if (ec != ER_OK) {
         return ec;
     }
@@ -176,10 +230,12 @@ ClientErrorCode ValkeySdk::Put(const std::vector<DataStorageUri> &remote_uris,
 
     const auto remaining_ms = RemainingMs(deadline_ms);
     if (!remaining_ms) {
+        LogSoftTimeout("put", "pre_acquire", remote_uris.size(), storage_identity_, configured_budget_ms, start_ms);
         return ER_SDK_TIMEOUT;
     }
     auto client = put_client_pool_->AcquireClient(*remaining_ms);
     if (!client) {
+        LogSoftTimeout("put", "pool_acquire", remote_uris.size(), storage_identity_, configured_budget_ms, start_ms);
         return ER_SDK_TIMEOUT;
     }
 
@@ -187,30 +243,46 @@ ClientErrorCode ValkeySdk::Put(const std::vector<DataStorageUri> &remote_uris,
     try {
         results = SetStrings(*client, redis_keys, values);
     } catch (...) {
-        return ER_SDKWRITE_ERROR;
-    }
-    if (DeadlineExpired(deadline_ms)) {
-        return ER_SDK_TIMEOUT;
-    }
-    if (results.size() != remote_uris.size()) {
+        if (DeadlineExpired(deadline_ms)) {
+            LogSoftTimeout("put", "redis_io", remote_uris.size(), storage_identity_, configured_budget_ms, start_ms);
+            return ER_SDK_TIMEOUT;
+        }
         return ER_SDKWRITE_ERROR;
     }
 
-    bool has_error = false;
+    if (results.size() != remote_uris.size()) {
+        if (DeadlineExpired(deadline_ms)) {
+            LogSoftTimeout("put", "redis_io", remote_uris.size(), storage_identity_, configured_budget_ms, start_ms);
+            return ER_SDK_TIMEOUT;
+        }
+        return ER_SDKWRITE_ERROR;
+    }
+
+    bool all_succeeded = true;
     bool has_timeout = false;
     for (const ErrorCode result : results) {
+        all_succeeded = all_succeeded && result == EC_OK;
         has_timeout = has_timeout || result == EC_TIMEOUT;
-        has_error = has_error || result != EC_OK;
-    }
-    if (has_timeout) {
-        return ER_SDK_TIMEOUT;
-    }
-    if (has_error) {
-        return ER_SDKWRITE_ERROR;
     }
 
-    actual_remote_uris->swap(successful_remote_uris);
-    return ER_OK;
+    const bool completed_late = DeadlineExpired(deadline_ms);
+    if (all_succeeded) {
+        actual_remote_uris->swap(successful_remote_uris);
+        if (completed_late) {
+            LogLatePutSuccess(remote_uris.size(), storage_identity_, configured_budget_ms, start_ms);
+        }
+        return ER_OK;
+    }
+    if (has_timeout || completed_late) {
+        LogSoftTimeout("put",
+                       has_timeout ? "redis_result" : "redis_io",
+                       remote_uris.size(),
+                       storage_identity_,
+                       configured_budget_ms,
+                       start_ms);
+        return ER_SDK_TIMEOUT;
+    }
+    return ER_SDKWRITE_ERROR;
 }
 
 ClientErrorCode ValkeySdk::Alloc(const std::vector<DataStorageUri> &remote_uris,
@@ -237,6 +309,7 @@ ValkeySdk::GetStrings(RedisClient &client, const std::vector<std::string> &keys,
 ClientErrorCode ValkeySdk::Preflight(const std::vector<DataStorageUri> &remote_uris,
                                      const BlockBuffers &local_buffers,
                                      const std::string &storage_identity,
+                                     bool allow_ignored_for_read,
                                      std::vector<std::string> &redis_keys,
                                      std::vector<std::size_t> &expected_sizes) {
     redis_keys.clear();
@@ -256,17 +329,20 @@ ClientErrorCode ValkeySdk::Preflight(const std::vector<DataStorageUri> &remote_u
                     continue;
                 }
                 if (iov.ignore) {
-                    return ER_INVALID_PARAMS;
-                }
-                if (iov.type != MemoryType::CPU) {
-                    return ER_UNSUPPORTED_MEMORY_TYPE;
-                }
-                if (!iov.base) {
-                    return ER_INVALID_LOCAL_BUFFERS;
-                }
-                const std::uintptr_t base = reinterpret_cast<std::uintptr_t>(iov.base);
-                if (iov.size > std::numeric_limits<std::uintptr_t>::max() - base) {
-                    return ER_INVALID_ADDRESS;
+                    if (!allow_ignored_for_read) {
+                        return ER_INVALID_PARAMS;
+                    }
+                } else {
+                    if (iov.type != MemoryType::CPU) {
+                        return ER_UNSUPPORTED_MEMORY_TYPE;
+                    }
+                    if (!iov.base) {
+                        return ER_INVALID_LOCAL_BUFFERS;
+                    }
+                    const std::uintptr_t base = reinterpret_cast<std::uintptr_t>(iov.base);
+                    if (iov.size > std::numeric_limits<std::uintptr_t>::max() - base) {
+                        return ER_INVALID_ADDRESS;
+                    }
                 }
                 if (iov.size > maximum_value_size - expected_size) {
                     return ER_INVALID_LOCAL_BUFFERS;

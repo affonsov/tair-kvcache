@@ -1106,6 +1106,8 @@ TEST_F(MetaIndexerTest, TestStorageUsageDataManipulation) {
 
         auto type = DataStorageType::DATA_STORAGE_TYPE_UNKNOWN;
         std::vector<std::uint64_t> expected_usage_vec{0, 100, 200, 300, 400, 0, 0, 700, 800, 900, 1000};
+        ASSERT_EQ(11, static_cast<int>(DataStorageType::COUNT));
+        ASSERT_EQ(11u, meta_indexer_->storage_usage_data_.storage_usage_by_type_.size());
 
         type = DataStorageType::DATA_STORAGE_TYPE_HF3FS;
         meta_indexer_->SetStorageUsageByType(type, expected_usage_vec.at(static_cast<std::size_t>(type)));
@@ -1158,6 +1160,7 @@ TEST_F(MetaIndexerTest, TestStorageUsageDataManipulation) {
 
         type = DataStorageType::DATA_STORAGE_TYPE_VALKEY;
         ASSERT_EQ(expected_usage_vec.at(static_cast<std::size_t>(type)), meta_indexer_->GetStorageUsageByType(type));
+        ASSERT_EQ(expected_usage_vec.at(10), meta_indexer_->storage_usage_data_.storage_usage_by_type_.at(10).load());
         ASSERT_EQ(300, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL));
 
         std::uint64_t expect_usage = 0;
@@ -1174,7 +1177,7 @@ TEST_F(MetaIndexerTest, TestStorageUsageDataManipulation) {
     {
         meta_indexer_->storage_usage_data_.Reset();
         auto type = DataStorageType::DATA_STORAGE_TYPE_UNKNOWN;
-        std::vector<std::uint64_t> expected_usage_vec{0, 100, 200, 300, 400, 0, 0, 0, 0, 900, 0};
+        std::vector<std::uint64_t> expected_usage_vec{0, 100, 200, 300, 400, 0, 0, 0, 0, 900, 1000};
 
         type = DataStorageType::DATA_STORAGE_TYPE_HF3FS;
         meta_indexer_->SetStorageUsageByType(type, expected_usage_vec.at(static_cast<std::size_t>(type)));
@@ -1217,6 +1220,14 @@ TEST_F(MetaIndexerTest, TestStorageUsageDataManipulation) {
         ASSERT_EQ(0, meta_indexer_->GetStorageUsageByType(type)); // expect to be proper handled
 
         type = DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD;
+        meta_indexer_->SetStorageUsageByType(type, expected_usage_vec.at(static_cast<std::size_t>(type)));
+        meta_indexer_->AddStorageUsageByType(type, 16);
+        ASSERT_EQ(expected_usage_vec.at(static_cast<std::size_t>(type)) + 16,
+                  meta_indexer_->GetStorageUsageByType(type));
+        meta_indexer_->SubStorageUsageByType(type, 16);
+        ASSERT_EQ(expected_usage_vec.at(static_cast<std::size_t>(type)), meta_indexer_->GetStorageUsageByType(type));
+
+        type = DataStorageType::DATA_STORAGE_TYPE_VALKEY;
         meta_indexer_->SetStorageUsageByType(type, expected_usage_vec.at(static_cast<std::size_t>(type)));
         meta_indexer_->AddStorageUsageByType(type, 16);
         ASSERT_EQ(expected_usage_vec.at(static_cast<std::size_t>(type)) + 16,
@@ -1304,19 +1315,44 @@ TEST_F(MetaIndexerTest, TestStorageUsageDataSeriDeseri) {
         ASSERT_EQ(200, storage_usage_data.GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE));
         ASSERT_EQ(0, storage_usage_data.GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL));
         ASSERT_EQ(0, storage_usage_data.GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD));
+        ASSERT_EQ(0, storage_usage_data.GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_VALKEY));
         ASSERT_EQ(0, storage_usage_data.GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS));
         ASSERT_EQ(0, storage_usage_data.GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_DUMMY));
-        ASSERT_EQ(0, storage_usage_data.GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_VALKEY));
     }
 
-    // Keep persisted metadata readable by older binaries until SSD accounting
-    // is actually used; a zero-valued new field is intentionally omitted.
+    // Keep persisted metadata readable by pre-Valkey binaries until Valkey
+    // accounting is actually used. Existing zero-valued SSD omission remains
+    // unchanged, so this is the exact pre-Valkey JSON shape.
     {
         storage_usage_data.Reset();
         storage_usage_data.SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, 10);
         EXPECT_EQ(
-            R"({"unknown":0,"hf3fs":0,"mooncake":0,"pace":10,"file":0,"vcns_hf3fs":0,"dummy":0,"event_report_l1p5":0,"event_report_l2":0,"valkey":0})",
+            R"({"unknown":0,"hf3fs":0,"mooncake":0,"pace":10,"file":0,"vcns_hf3fs":0,"dummy":0,"event_report_l1p5":0,"event_report_l2":0})",
             storage_usage_data.Serialize());
+
+        storage_usage_data.SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD, 20);
+        EXPECT_EQ(
+            R"({"unknown":0,"hf3fs":0,"mooncake":0,"pace":10,"file":0,"vcns_hf3fs":0,"dummy":0,"event_report_l1p5":0,"event_report_l2":0,"pace_ssd":20})",
+            storage_usage_data.Serialize());
+    }
+
+    // Nonzero Valkey usage is persisted and recovered in its internal slot.
+    {
+        storage_usage_data.Reset();
+        storage_usage_data.SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_VALKEY, 1234);
+        const std::string serialized = storage_usage_data.Serialize();
+        EXPECT_EQ(
+            R"({"unknown":0,"hf3fs":0,"mooncake":0,"pace":0,"file":0,"vcns_hf3fs":0,"dummy":0,"event_report_l1p5":0,"event_report_l2":0,"valkey":1234})",
+            serialized);
+
+        storage_usage_data.Reset();
+        ASSERT_EQ(EC_OK, storage_usage_data.Deserialize(serialized));
+        ASSERT_EQ(11u, storage_usage_data.storage_usage_by_type_.size());
+        EXPECT_EQ(1234u,
+                  storage_usage_data.storage_usage_by_type_
+                      .at(static_cast<std::size_t>(DataStorageType::DATA_STORAGE_TYPE_VALKEY))
+                      .load());
+        EXPECT_EQ(1234u, storage_usage_data.GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_VALKEY));
     }
 
     // Legal input: whitespace-padded JSON

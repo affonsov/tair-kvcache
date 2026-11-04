@@ -56,6 +56,7 @@ cc_library(
     deps = [
         ":sdk_common",
         "//kv_cache_manager/common:client_pool",
+        "//kv_cache_manager/common:logger",
         "//kv_cache_manager/common:redis_client",
         "//kv_cache_manager/data_storage:common_define",
         "//kv_cache_manager/data_storage:valkey_uri_util",

@@ -35,6 +35,21 @@ DataStorageUri RealLocation(const std::string &opaque_id, std::size_t size) {
     return uri;
 }
 
+class RedisKeyCleanupGuard {
+public:
+    RedisKeyCleanupGuard(RedisClient &client, const std::vector<std::string> &keys) : client_(client), keys_(keys) {}
+
+    ~RedisKeyCleanupGuard() noexcept {
+        try {
+            (void)client_.Delete(keys_);
+        } catch (...) {}
+    }
+
+private:
+    RedisClient &client_;
+    const std::vector<std::string> &keys_;
+};
+
 class ValkeySdkRealServiceTest : public TESTBASE {};
 
 TEST_F(ValkeySdkRealServiceTest, MultiSegmentBinaryRoundTrip) {
@@ -51,6 +66,7 @@ TEST_F(ValkeySdkRealServiceTest, MultiSegmentBinaryRoundTrip) {
         ASSERT_TRUE(ValkeyLocationToRedisKey(uri, "vlk04-real", key));
         redis_keys.push_back(std::move(key));
     }
+    RedisKeyCleanupGuard cleanup_guard(cleanup_client, redis_keys);
     (void)cleanup_client.Delete(redis_keys);
 
     ValkeySdk sdk;
@@ -76,9 +92,6 @@ TEST_F(ValkeySdkRealServiceTest, MultiSegmentBinaryRoundTrip) {
     ASSERT_EQ(ER_OK, sdk.Get(uris, {get_binary, BlockBuffer{}}));
     EXPECT_EQ(std::string("ab", 2), std::string(get_first, sizeof(get_first)));
     EXPECT_EQ(std::string("\0cd\xff\x80", 5), std::string(get_second, sizeof(get_second)));
-
-    EXPECT_EQ(std::vector<ErrorCode>(redis_keys.size(), EC_OK), cleanup_client.Delete(redis_keys));
-    cleanup_client.Close();
 }
 
 } // namespace
