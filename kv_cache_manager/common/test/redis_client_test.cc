@@ -1,3 +1,8 @@
+#include <algorithm>
+#include <cstddef>
+#include <string>
+#include <vector>
+
 #include "kv_cache_manager/common/redis_client.h"
 #include "kv_cache_manager/common/test/mock_redis_client.h"
 #include "kv_cache_manager/common/test/redis_test_base.h"
@@ -14,6 +19,8 @@ public:
 public:
     void PrepareMockRedisClient(const std::string &user_info, const std::string &host, int32_t port);
     void CheckReplyType(const redisReply *r, const int expected_type) const;
+    std::vector<ReplyUPtr> MakeStatusReplies(std::size_t count);
+    std::vector<ReplyUPtr> MakeStringReplies(const std::vector<std::string> &values);
 
 private:
     std::unique_ptr<MockRedisClient> redis_client_;
@@ -40,6 +47,24 @@ void RedisClientTest::PrepareMockRedisClient(const std::string &user_info, const
 void RedisClientTest::CheckReplyType(const redisReply *r, const int expected_type) const {
     ASSERT_TRUE(r);
     ASSERT_EQ(expected_type, r->type);
+}
+
+std::vector<RedisClient::ReplyUPtr> RedisClientTest::MakeStatusReplies(const std::size_t count) {
+    std::vector<ReplyUPtr> replies;
+    replies.reserve(count);
+    for (std::size_t i = 0; i < count; ++i) {
+        replies.emplace_back(MakeFakeReply(REDIS_REPLY_STATUS, "OK"));
+    }
+    return replies;
+}
+
+std::vector<RedisClient::ReplyUPtr> RedisClientTest::MakeStringReplies(const std::vector<std::string> &values) {
+    std::vector<ReplyUPtr> replies;
+    replies.reserve(values.size());
+    for (const std::string &value : values) {
+        replies.emplace_back(MakeFakeReply(REDIS_REPLY_STRING, value));
+    }
+    return replies;
 }
 
 TEST_F(RedisClientTest, TestCommandPipelineSimple) {
@@ -292,6 +317,196 @@ TEST_F(RedisClientTest, TestGetStringsShortReplyFailsClosed) {
     std::vector<std::string> out_values{"stale"};
     ASSERT_EQ(std::vector<ErrorCode>(keys.size(), EC_ERROR), redis_client_->GetStrings(keys, out_values));
     ASSERT_EQ(std::vector<std::string>(keys.size()), out_values);
+}
+
+TEST_F(RedisClientTest, TestStringPipelinesSplitAtCommandLimitAndPreserveOrder) {
+    EXPECT_CALL(*redis_client_, IsContextOk()).WillRepeatedly(Return(true));
+
+    constexpr std::size_t kExpectedMaxCommandCount = 64;
+    constexpr std::size_t kItemCount = kExpectedMaxCommandCount + 1;
+    std::vector<std::string> keys;
+    std::vector<std::string> values;
+    keys.reserve(kItemCount);
+    values.reserve(kItemCount);
+    for (std::size_t i = 0; i < kItemCount; ++i) {
+        keys.emplace_back("chunk-key-" + std::to_string(i));
+        std::string value = "chunk-value-" + std::to_string(i);
+        value.push_back('\0');
+        value.push_back(static_cast<char>(0x80 + i % 0x40));
+        values.emplace_back(std::move(value));
+    }
+
+    {
+        InSequence sequence;
+        EXPECT_CALL(*redis_client_, TryExecPipeline(_)).WillOnce(Invoke([&](const std::vector<CmdArgs> &commands) {
+            EXPECT_EQ(kExpectedMaxCommandCount, commands.size());
+            for (std::size_t i = 0; i < commands.size(); ++i) {
+                EXPECT_EQ((CmdArgs{"SET", keys[i], values[i]}), commands[i]);
+            }
+            return MakeStatusReplies(commands.size());
+        }));
+        EXPECT_CALL(*redis_client_, TryExecPipeline(_)).WillOnce(Invoke([&](const std::vector<CmdArgs> &commands) {
+            EXPECT_EQ(1u, commands.size());
+            if (!commands.empty()) {
+                EXPECT_EQ((CmdArgs{"SET", keys.back(), values.back()}), commands.front());
+            }
+            return MakeStatusReplies(commands.size());
+        }));
+    }
+    EXPECT_EQ(std::vector<ErrorCode>(kItemCount, EC_OK), redis_client_->SetStrings(keys, values));
+
+    {
+        InSequence sequence;
+        EXPECT_CALL(*redis_client_, TryExecPipeline(_)).WillOnce(Invoke([&](const std::vector<CmdArgs> &commands) {
+            EXPECT_EQ(kExpectedMaxCommandCount, commands.size());
+            for (std::size_t i = 0; i < commands.size(); ++i) {
+                EXPECT_EQ((CmdArgs{"GET", keys[i]}), commands[i]);
+            }
+            return MakeStringReplies(
+                std::vector<std::string>(values.begin(), values.begin() + kExpectedMaxCommandCount));
+        }));
+        EXPECT_CALL(*redis_client_, TryExecPipeline(_)).WillOnce(Invoke([&](const std::vector<CmdArgs> &commands) {
+            EXPECT_EQ(1u, commands.size());
+            if (!commands.empty()) {
+                EXPECT_EQ((CmdArgs{"GET", keys.back()}), commands.front());
+            }
+            return MakeStringReplies({values.back()});
+        }));
+    }
+    std::vector<std::string> out_values;
+    EXPECT_EQ(std::vector<ErrorCode>(kItemCount, EC_OK), redis_client_->GetStrings(keys, out_values));
+    EXPECT_EQ(values, out_values);
+}
+
+TEST_F(RedisClientTest, TestStringPipelinesSplitAtByteLimitAndIsolateOversizedItems) {
+    EXPECT_CALL(*redis_client_, IsContextOk()).WillRepeatedly(Return(true));
+
+    constexpr std::size_t kExpectedMaxRequestPayloadBytes = 1024 * 1024;
+    const std::string exact_key = "set-exact";
+    const std::string exact_value(kExpectedMaxRequestPayloadBytes - 3 - exact_key.size(), 'x');
+    const std::string oversized_value(kExpectedMaxRequestPayloadBytes + 1, 'y');
+    const std::vector<std::string> set_keys{exact_key, "set-oversized", "set-tail"};
+    const std::vector<std::string> set_values{exact_value, oversized_value, "tail"};
+    {
+        InSequence sequence;
+        for (std::size_t i = 0; i < set_keys.size(); ++i) {
+            EXPECT_CALL(
+                *redis_client_,
+                TryExecPipeline(ElementsAre(ElementsAre(StrEq("SET"), StrEq(set_keys[i]), StrEq(set_values[i])))))
+                .WillOnce(Invoke(
+                    [this](const std::vector<CmdArgs> &commands) { return MakeStatusReplies(commands.size()); }));
+        }
+    }
+    EXPECT_EQ(std::vector<ErrorCode>(set_keys.size(), EC_OK), redis_client_->SetStrings(set_keys, set_values));
+
+    const std::string exact_get_key(kExpectedMaxRequestPayloadBytes - 3, 'a');
+    const std::string oversized_get_key(kExpectedMaxRequestPayloadBytes - 2, 'b');
+    const std::vector<std::string> get_keys{exact_get_key, oversized_get_key, "get-tail"};
+    const std::vector<std::string> get_values{"exact", "oversized", "tail"};
+    {
+        InSequence sequence;
+        for (std::size_t i = 0; i < get_keys.size(); ++i) {
+            EXPECT_CALL(*redis_client_, TryExecPipeline(ElementsAre(ElementsAre(StrEq("GET"), StrEq(get_keys[i])))))
+                .WillOnce(Invoke([this, &get_values, i](const std::vector<CmdArgs> &) {
+                    return MakeStringReplies({get_values[i]});
+                }));
+        }
+    }
+    std::vector<std::string> out_values;
+    EXPECT_EQ(std::vector<ErrorCode>(get_keys.size(), EC_OK), redis_client_->GetStrings(get_keys, out_values));
+    EXPECT_EQ(get_values, out_values);
+}
+
+TEST_F(RedisClientTest, TestStringPipelineMiddleFailureStopsLaterChunks) {
+    EXPECT_CALL(*redis_client_, IsContextOk()).WillRepeatedly(Return(true));
+
+    constexpr std::size_t kChunkSize = 64;
+    constexpr std::size_t kItemCount = kChunkSize * 2 + 1;
+    std::vector<std::string> keys;
+    std::vector<std::string> values;
+    keys.reserve(kItemCount);
+    values.reserve(kItemCount);
+    for (std::size_t i = 0; i < kItemCount; ++i) {
+        keys.emplace_back("failure-key-" + std::to_string(i));
+        values.emplace_back("failure-value-" + std::to_string(i));
+    }
+
+    {
+        InSequence sequence;
+        EXPECT_CALL(*redis_client_, TryExecPipeline(_)).WillOnce(Invoke([this](const std::vector<CmdArgs> &commands) {
+            return MakeStatusReplies(commands.size());
+        }));
+        EXPECT_CALL(*redis_client_, TryExecPipeline(_)).WillOnce(Return(ByMove(std::vector<ReplyUPtr>{})));
+    }
+    std::vector<ErrorCode> expected_set(kItemCount, EC_ERROR);
+    std::fill(expected_set.begin(), expected_set.begin() + kChunkSize, EC_OK);
+    EXPECT_EQ(expected_set, redis_client_->SetStrings(keys, values));
+
+    {
+        InSequence sequence;
+        EXPECT_CALL(*redis_client_, TryExecPipeline(_)).WillOnce(Invoke([this, &values](const std::vector<CmdArgs> &) {
+            return MakeStringReplies(std::vector<std::string>(values.begin(), values.begin() + kChunkSize));
+        }));
+        EXPECT_CALL(*redis_client_, TryExecPipeline(_)).WillOnce(Invoke([this, &values](const std::vector<CmdArgs> &) {
+            return MakeStringReplies(
+                std::vector<std::string>(values.begin() + kChunkSize, values.begin() + kChunkSize * 2 - 1));
+        }));
+    }
+    std::vector<ErrorCode> expected_get(kItemCount, EC_ERROR);
+    std::fill(expected_get.begin(), expected_get.begin() + kChunkSize, EC_OK);
+    std::vector<std::string> expected_values(kItemCount);
+    std::copy(values.begin(), values.begin() + kChunkSize, expected_values.begin());
+    std::vector<std::string> out_values;
+    EXPECT_EQ(expected_get, redis_client_->GetStrings(keys, out_values));
+    EXPECT_EQ(expected_values, out_values);
+}
+
+TEST_F(RedisClientTest, TestStringPipelineReplyErrorsContinueAcrossChunks) {
+    EXPECT_CALL(*redis_client_, IsContextOk()).WillRepeatedly(Return(true));
+
+    constexpr std::size_t kChunkSize = 64;
+    constexpr std::size_t kItemCount = kChunkSize + 1;
+    constexpr std::size_t kErrorIndex = 7;
+    std::vector<std::string> keys;
+    std::vector<std::string> values;
+    keys.reserve(kItemCount);
+    values.reserve(kItemCount);
+    for (std::size_t i = 0; i < kItemCount; ++i) {
+        keys.emplace_back("reply-key-" + std::to_string(i));
+        values.emplace_back("reply-value-" + std::to_string(i));
+    }
+
+    {
+        InSequence sequence;
+        EXPECT_CALL(*redis_client_, TryExecPipeline(_)).WillOnce(Invoke([this](const std::vector<CmdArgs> &commands) {
+            auto replies = MakeStatusReplies(commands.size());
+            replies[kErrorIndex] = MakeFakeReply(REDIS_REPLY_ERROR, "ERR injected");
+            return replies;
+        }));
+        EXPECT_CALL(*redis_client_, TryExecPipeline(_)).WillOnce(Invoke([this](const std::vector<CmdArgs> &commands) {
+            return MakeStatusReplies(commands.size());
+        }));
+    }
+    std::vector<ErrorCode> expected(kItemCount, EC_OK);
+    expected[kErrorIndex] = EC_ERROR;
+    EXPECT_EQ(expected, redis_client_->SetStrings(keys, values));
+
+    {
+        InSequence sequence;
+        EXPECT_CALL(*redis_client_, TryExecPipeline(_)).WillOnce(Invoke([this, &values](const std::vector<CmdArgs> &) {
+            auto replies = MakeStringReplies(std::vector<std::string>(values.begin(), values.begin() + kChunkSize));
+            replies[kErrorIndex] = MakeFakeReply(REDIS_REPLY_ERROR, "ERR injected");
+            return replies;
+        }));
+        EXPECT_CALL(*redis_client_, TryExecPipeline(_)).WillOnce(Invoke([this, &values](const std::vector<CmdArgs> &) {
+            return MakeStringReplies({values.back()});
+        }));
+    }
+    std::vector<std::string> expected_values = values;
+    expected_values[kErrorIndex].clear();
+    std::vector<std::string> out_values;
+    EXPECT_EQ(expected, redis_client_->GetStrings(keys, out_values));
+    EXPECT_EQ(expected_values, out_values);
 }
 
 TEST_F(RedisClientTest, TestUpdate) {

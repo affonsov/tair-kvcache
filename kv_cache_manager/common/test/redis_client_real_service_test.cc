@@ -1,3 +1,7 @@
+#include <cstddef>
+#include <string>
+#include <vector>
+
 #include "kv_cache_manager/common/redis_client.h"
 #include "kv_cache_manager/common/test/redis_test_environment.h"
 #include "kv_cache_manager/common/unittest.h"
@@ -151,6 +155,36 @@ TEST_F(RedisClientRealServiceTest, TestBinaryStrings) {
     redis_client_->Close();
 }
 
+TEST_F(RedisClientRealServiceTest, TestMultiChunkBinaryStrings) {
+    ASSERT_TRUE(redis_client_->Open());
+
+    constexpr std::size_t kItemCount = 65;
+    std::vector<std::string> keys;
+    std::vector<std::string> values;
+    keys.reserve(kItemCount);
+    values.reserve(kItemCount);
+    for (std::size_t i = 0; i < kItemCount; ++i) {
+        std::string key = "redis_client_multi_chunk_binary_key_" + std::to_string(i);
+        key.push_back('\0');
+        key.push_back(static_cast<char>(0x80 + i % 0x40));
+        keys.emplace_back(std::move(key));
+
+        std::string value = "multi_chunk_binary_value_" + std::to_string(i);
+        value.push_back('\0');
+        value.push_back(static_cast<char>(0xc0 + i % 0x40));
+        values.emplace_back(std::move(value));
+    }
+    (void)redis_client_->Delete(keys);
+
+    EXPECT_EQ(std::vector<ErrorCode>(keys.size(), EC_OK), redis_client_->SetStrings(keys, values));
+    std::vector<std::string> out_values;
+    EXPECT_EQ(std::vector<ErrorCode>(keys.size(), EC_OK), redis_client_->GetStrings(keys, out_values));
+    EXPECT_EQ(values, out_values);
+
+    EXPECT_EQ(std::vector<ErrorCode>(keys.size(), EC_OK), redis_client_->Delete(keys));
+    redis_client_->Close();
+}
+
 TEST_F(RedisClientRealServiceTest, TestNotExistKey) {
     ASSERT_TRUE(redis_client_->Open());
 
@@ -199,6 +233,7 @@ TEST_F(RedisClientRealServiceTest, TestNotExistKey) {
     ASSERT_EQ(std::vector<ErrorCode>(all_keys.size(), EC_OK), ec_per_key);
     ASSERT_EQ(expected_is_exist_vec, out_is_exist_vec);
 
+    EXPECT_EQ(std::vector<ErrorCode>(keys.size(), EC_OK), redis_client_->Delete(keys));
     redis_client_->Close();
 }
 
