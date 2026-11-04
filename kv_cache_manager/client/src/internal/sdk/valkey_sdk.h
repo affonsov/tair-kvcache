@@ -39,6 +39,7 @@ private:
     static ClientErrorCode Preflight(const std::vector<DataStorageUri> &remote_uris,
                                      const BlockBuffers &local_buffers,
                                      const std::string &storage_identity,
+                                     bool allow_ignored_for_read,
                                      std::vector<std::string> &redis_keys,
                                      std::vector<std::size_t> &expected_sizes);
     static ClientErrorCode Gather(const BlockBuffers &local_buffers,

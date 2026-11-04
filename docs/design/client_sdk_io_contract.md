@@ -28,6 +28,7 @@
 | LocalFile / NFS | 逐 block | 组级 + 逐 block | hard | abort 路径 sync GPU stream（GpuStreamDrainGuard），真取消 |
 | HF3FS | hf3fs_wait_for_ios(abs_timeout) | 逐 block | hard | 数据先落自有 shm iov；超时不执行 CopyIovs；泄漏 iov/IOR 而不 free（free = UAF） |
 | Mooncake | 逐 key 前置检查 | 逐 key | soft | 上游无取消语义；超时路径输出可归因日志（key/buffer/elapsed） |
+| Valkey | Static admission and client-pool deadlines | Batch granularity | soft | Inherited blocking Redis command I/O cannot currently be cancelled or further bounded by the SDK deadline; a late Get does not write to caller buffers; a late Put publishes actual URIs and returns success only when every SET reports `EC_OK` |
 | TairMempool (PACE) | PACE 内部超时（10s） | PACE 自管理 | hard（staging + cancel_and_drain） | **不读取注入的预算**（自行管理内部超时）；要求内部超时 < wrapper 预算（10s < 15s） |
 
 注：PACE 属跨仓库生产路径，本仓库不修改其实现；注入字段对它是纯增量（不读即无行为
@@ -53,3 +54,12 @@
 5. **Mooncake 为 soft 级**：超时后在飞的 DMA 无法取消；调用方在收到超时后立即
    复用相应 buffer 是文档化的数据竞争。逐 key 准入把暴露面从整批降到 ≤1 个在飞
    key。
+6. **Valkey uses a soft timeout**: Static budgets bound admission and
+   client-pool waits. Inherited blocking Redis command I/O cannot currently be
+   cancelled or further bounded by the SDK deadline. Get checks the deadline
+   again after the command returns; a late Get returns `ER_SDK_TIMEOUT` and does
+   not scatter to caller buffers. Put first validates the result count and each
+   key's result. A late Put publishes `actual_remote_uris` and returns `ER_OK`
+   only when every SET reports `EC_OK`; otherwise, the timed-out operation
+   returns `ER_SDK_TIMEOUT`. Hard Redis socket/I/O deadlines and retry
+   cancellation are outside the current scope.

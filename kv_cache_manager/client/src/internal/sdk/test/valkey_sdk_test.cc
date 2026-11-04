@@ -2,6 +2,8 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
+#include <new>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <utility>
@@ -14,6 +16,26 @@
 namespace kv_cache_manager {
 namespace {
 
+enum class ClientThrowMode {
+    NONE,
+    BAD_ALLOC,
+    LENGTH_ERROR,
+    RUNTIME_ERROR,
+};
+
+void ThrowIfConfigured(ClientThrowMode mode) {
+    switch (mode) {
+    case ClientThrowMode::NONE:
+        return;
+    case ClientThrowMode::BAD_ALLOC:
+        throw std::bad_alloc();
+    case ClientThrowMode::LENGTH_ERROR:
+        throw std::length_error("fake Redis length error");
+    case ClientThrowMode::RUNTIME_ERROR:
+        throw std::runtime_error("fake Redis error");
+    }
+}
+
 struct FakeRedisState {
     std::size_t set_calls = 0;
     std::size_t get_calls = 0;
@@ -21,6 +43,8 @@ struct FakeRedisState {
     bool use_get_results = false;
     int set_delay_ms = 0;
     int get_delay_ms = 0;
+    ClientThrowMode set_throw_mode = ClientThrowMode::NONE;
+    ClientThrowMode get_throw_mode = ClientThrowMode::NONE;
     std::vector<ErrorCode> set_results;
     std::vector<ErrorCode> get_results;
     std::vector<std::string> get_values;
@@ -59,6 +83,7 @@ protected:
         if (state_->set_delay_ms > 0) {
             std::this_thread::sleep_for(std::chrono::milliseconds(state_->set_delay_ms));
         }
+        ThrowIfConfigured(state_->set_throw_mode);
         state_->last_keys = keys;
         state_->last_values = values;
         return state_->use_set_results ? state_->set_results : std::vector<ErrorCode>(keys.size(), EC_OK);
@@ -70,6 +95,7 @@ protected:
         if (state_->get_delay_ms > 0) {
             std::this_thread::sleep_for(std::chrono::milliseconds(state_->get_delay_ms));
         }
+        ThrowIfConfigured(state_->get_throw_mode);
         state_->last_keys = keys;
         values = state_->get_values;
         return state_->use_get_results ? state_->get_results : std::vector<ErrorCode>(keys.size(), EC_OK);
@@ -81,7 +107,7 @@ private:
     std::vector<std::string> created_endpoints_;
 };
 
-std::shared_ptr<SdkBackendConfig> MakeSdkConfig(int get_timeout_ms = 7, int put_timeout_ms = 11) {
+std::shared_ptr<SdkBackendConfig> MakeSdkConfig(int get_timeout_ms = 2000, int put_timeout_ms = 2000) {
     auto config = std::make_shared<SdkBackendConfig>();
     config->set_type(DataStorageType::DATA_STORAGE_TYPE_VALKEY);
     SdkTimeoutConfig timeout;
@@ -236,7 +262,6 @@ TEST_F(ValkeySdkTest, InvalidRequestsAreRejectedBeforeIoOrDestinationWrites) {
         {{valid},
          {{std::vector<Iov>{Iov{MemoryType::GPU, source, sizeof(source), false}}}},
          ER_UNSUPPORTED_MEMORY_TYPE},
-        {{valid}, {{std::vector<Iov>{Iov{MemoryType::CPU, source, sizeof(source), true}}}}, ER_INVALID_PARAMS},
     };
 
     for (const auto &test_case : cases) {
@@ -257,6 +282,60 @@ TEST_F(ValkeySdkTest, InvalidRequestsAreRejectedBeforeIoOrDestinationWrites) {
     auto actual = std::make_shared<std::vector<DataStorageUri>>(1, sentinel);
     EXPECT_EQ(ER_INVALID_PARAMS, sdk_->Put({valid}, {CpuBuffer(source, sizeof(source))}, nullptr));
     EXPECT_EQ(sentinel.ToUriString(), actual->at(0).ToUriString());
+}
+
+TEST_F(ValkeySdkTest, ZeroLengthBuffersRejectMissingOrMalformedDeclaredSizesBeforeIo) {
+    const std::string opaque_id = "00000000000000000000000000000003";
+    const std::vector<DataStorageUri> invalid_uris{
+        DataStorageUri("valkey://valkey-primary/" + opaque_id),
+        DataStorageUri("valkey://valkey-primary/" + opaque_id + "?size=abc"),
+        DataStorageUri("valkey://valkey-primary/" + opaque_id + "?size=-1"),
+    };
+    const DataStorageUri sentinel = MakeLocation("valkey-primary", "ffffffffffffffffffffffffffffffff", 1);
+
+    for (const auto &uri : invalid_uris) {
+        auto actual = std::make_shared<std::vector<DataStorageUri>>(1, sentinel);
+        EXPECT_EQ(ER_INVALID_PARAMS, sdk_->Get({uri}, {BlockBuffer{}}));
+        EXPECT_EQ(ER_INVALID_PARAMS, sdk_->Put({uri}, {BlockBuffer{}}, actual));
+        ASSERT_EQ(1u, actual->size());
+        EXPECT_EQ(sentinel.ToUriString(), actual->at(0).ToUriString());
+    }
+    EXPECT_EQ(0u, state_->get_calls);
+    EXPECT_EQ(0u, state_->set_calls);
+}
+
+TEST_F(ValkeySdkTest, GetSkipsIgnoredIovsButCountsThemInDeclaredSizeAndPutRejectsThem) {
+    char first[2] = {'x', 'x'};
+    char ignored[3] = {'i', 'i', 'i'};
+    char following[2] = {'y', 'y'};
+    BlockBuffer buffer;
+    buffer.iovs = {
+        Iov{MemoryType::CPU, first, sizeof(first), false},
+        Iov{MemoryType::GPU, ignored, sizeof(ignored), true},
+        Iov{MemoryType::GPU, nullptr, 1, true},
+        Iov{MemoryType::CPU, following, sizeof(following), false},
+    };
+    const DataStorageUri wrong_size =
+        MakeLocation("valkey-primary", "00000000000000000000000000000010", sizeof(first) + sizeof(following));
+    const DataStorageUri uri = MakeLocation(
+        "valkey-primary", "00000000000000000000000000000010", sizeof(first) + sizeof(ignored) + 1 + sizeof(following));
+    const DataStorageUri sentinel = MakeLocation("valkey-primary", "ffffffffffffffffffffffffffffffff", 1);
+    auto actual = std::make_shared<std::vector<DataStorageUri>>(1, sentinel);
+
+    EXPECT_EQ(ER_INVALID_PARAMS, sdk_->Get({wrong_size}, {buffer}));
+    EXPECT_EQ(0u, state_->get_calls);
+
+    state_->get_values = {"abXYZQde"};
+    ASSERT_EQ(ER_OK, sdk_->Get({uri}, {buffer}));
+    EXPECT_EQ("ab", std::string(first, sizeof(first)));
+    EXPECT_EQ("iii", std::string(ignored, sizeof(ignored)));
+    EXPECT_EQ("de", std::string(following, sizeof(following)));
+
+    EXPECT_EQ(ER_INVALID_PARAMS, sdk_->Put({uri}, {buffer}, actual));
+    ASSERT_EQ(1u, actual->size());
+    EXPECT_EQ(sentinel.ToUriString(), actual->at(0).ToUriString());
+    EXPECT_EQ(1u, state_->get_calls);
+    EXPECT_EQ(0u, state_->set_calls);
 }
 
 TEST_F(ValkeySdkTest, PutPreservesOutputForBatchErrorsTimeoutsAndCardinalityMismatch) {
@@ -367,47 +446,114 @@ TEST_F(ValkeySdkTest, GetDefendsCardinalityAndPropagatesTimeoutAfterValidPeers) 
     EXPECT_EQ(3u, state_->get_calls);
 }
 
-TEST_F(ValkeySdkTest, StaticTimeoutsPreservePutOutputAndGetDestination) {
+TEST_F(ValkeySdkTest, ClientExceptionsMapToCurrentErrorsWithoutPublishingOutputs) {
+    char destination = 'x';
+    char source = 'v';
+    const std::vector<DataStorageUri> uris{MakeLocation("valkey-primary", "00000000000000000000000000000011", 1)};
+    const DataStorageUri sentinel = MakeLocation("valkey-primary", "ffffffffffffffffffffffffffffffff", 1);
+
+    const std::vector<std::pair<ClientThrowMode, ClientErrorCode>> get_cases{
+        {ClientThrowMode::BAD_ALLOC, ER_INVALID_LOCAL_BUFFERS},
+        {ClientThrowMode::LENGTH_ERROR, ER_INVALID_LOCAL_BUFFERS},
+        {ClientThrowMode::RUNTIME_ERROR, ER_SDKREAD_ERROR},
+    };
+    for (const auto &[throw_mode, expected] : get_cases) {
+        state_->get_throw_mode = throw_mode;
+        destination = 'x';
+        EXPECT_EQ(expected, sdk_->Get(uris, {CpuBuffer(&destination, 1)}));
+        EXPECT_EQ('x', destination);
+    }
+    state_->get_throw_mode = ClientThrowMode::NONE;
+
+    auto actual = std::make_shared<std::vector<DataStorageUri>>(1, sentinel);
+    state_->set_throw_mode = ClientThrowMode::RUNTIME_ERROR;
+    EXPECT_EQ(ER_SDKWRITE_ERROR, sdk_->Put(uris, {CpuBuffer(&source, 1)}, actual));
+    ASSERT_EQ(1u, actual->size());
+    EXPECT_EQ(sentinel.ToUriString(), actual->at(0).ToUriString());
+    EXPECT_EQ(get_cases.size(), state_->get_calls);
+    EXPECT_EQ(1u, state_->set_calls);
+}
+
+TEST_F(ValkeySdkTest, SoftTimeoutKeepsLateGetIsolatedAndPublishesConfirmedLatePut) {
+    constexpr int kShortTimeoutMs = 20;
+    constexpr int kFakeDelayMs = 100;
+    auto timeout_state = std::make_shared<FakeRedisState>();
+    TestValkeySdk timeout_sdk(timeout_state);
+    ASSERT_EQ(ER_OK, timeout_sdk.Init(MakeSdkConfig(kShortTimeoutMs, kShortTimeoutMs), MakeStorageConfig()));
+
     char source = 'v';
     char destination = 'x';
     const std::vector<DataStorageUri> uris{MakeLocation("valkey-primary", "0000000000000000000000000000000d", 1)};
     const DataStorageUri sentinel = MakeLocation("valkey-primary", "ffffffffffffffffffffffffffffffff", 1);
     auto actual = std::make_shared<std::vector<DataStorageUri>>(1, sentinel);
 
-    state_->set_delay_ms = 20;
-    EXPECT_EQ(ER_SDK_TIMEOUT, sdk_->Put(uris, {CpuBuffer(&source, 1)}, actual));
+    timeout_state->set_delay_ms = kFakeDelayMs;
+    EXPECT_EQ(ER_OK, timeout_sdk.Put(uris, {CpuBuffer(&source, 1)}, actual));
+    ASSERT_EQ(1u, actual->size());
+    EXPECT_EQ(uris[0].ToUriString(), actual->at(0).ToUriString());
+
+    *actual = {sentinel};
+    timeout_state->use_set_results = true;
+    timeout_state->set_results = {EC_ERROR};
+    EXPECT_EQ(ER_SDK_TIMEOUT, timeout_sdk.Put(uris, {CpuBuffer(&source, 1)}, actual));
+    ASSERT_EQ(1u, actual->size());
     EXPECT_EQ(sentinel.ToUriString(), actual->at(0).ToUriString());
 
-    state_->get_delay_ms = 20;
-    state_->get_values = {"z"};
-    EXPECT_EQ(ER_SDK_TIMEOUT, sdk_->Get(uris, {CpuBuffer(&destination, 1)}));
+    timeout_state->set_throw_mode = ClientThrowMode::RUNTIME_ERROR;
+    EXPECT_EQ(ER_SDK_TIMEOUT, timeout_sdk.Put(uris, {CpuBuffer(&source, 1)}, actual));
+    ASSERT_EQ(1u, actual->size());
+    EXPECT_EQ(sentinel.ToUriString(), actual->at(0).ToUriString());
+    timeout_state->set_throw_mode = ClientThrowMode::NONE;
+
+    timeout_state->get_delay_ms = kFakeDelayMs;
+    timeout_state->get_values = {"z"};
+    EXPECT_EQ(ER_SDK_TIMEOUT, timeout_sdk.Get(uris, {CpuBuffer(&destination, 1)}));
     EXPECT_EQ('x', destination);
-    EXPECT_EQ(1u, state_->set_calls);
-    EXPECT_EQ(1u, state_->get_calls);
+
+    const std::vector<ClientThrowMode> get_throw_modes{
+        ClientThrowMode::BAD_ALLOC,
+        ClientThrowMode::LENGTH_ERROR,
+        ClientThrowMode::RUNTIME_ERROR,
+    };
+    for (const ClientThrowMode throw_mode : get_throw_modes) {
+        timeout_state->get_throw_mode = throw_mode;
+        destination = 'x';
+        EXPECT_EQ(ER_SDK_TIMEOUT, timeout_sdk.Get(uris, {CpuBuffer(&destination, 1)}));
+        EXPECT_EQ('x', destination);
+        timeout_state->get_throw_mode = ClientThrowMode::NONE;
+    }
+
+    EXPECT_EQ(3u, timeout_state->set_calls);
+    EXPECT_EQ(1u + get_throw_modes.size(), timeout_state->get_calls);
 }
 
 TEST_F(ValkeySdkTest, PoolExhaustionFailsWithoutBatchIo) {
+    constexpr int kShortPoolBudgetMs = 20;
+    auto timeout_state = std::make_shared<FakeRedisState>();
+    TestValkeySdk timeout_sdk(timeout_state);
+    ASSERT_EQ(ER_OK, timeout_sdk.Init(MakeSdkConfig(kShortPoolBudgetMs, kShortPoolBudgetMs), MakeStorageConfig()));
+
     char value = 'v';
     const std::vector<DataStorageUri> uris{MakeLocation("valkey-primary", "0000000000000000000000000000000e", 1)};
     const BlockBuffers buffers{CpuBuffer(&value, 1)};
     auto actual = std::make_shared<std::vector<DataStorageUri>>();
 
-    auto put_one = sdk_->put_client_pool_->AcquireClient(0);
-    auto put_two = sdk_->put_client_pool_->AcquireClient(0);
-    auto put_three = sdk_->put_client_pool_->AcquireClient(0);
-    auto put_four = sdk_->put_client_pool_->AcquireClient(0);
+    auto put_one = timeout_sdk.put_client_pool_->AcquireClient(0);
+    auto put_two = timeout_sdk.put_client_pool_->AcquireClient(0);
+    auto put_three = timeout_sdk.put_client_pool_->AcquireClient(0);
+    auto put_four = timeout_sdk.put_client_pool_->AcquireClient(0);
     ASSERT_TRUE(put_one && put_two && put_three && put_four);
-    EXPECT_EQ(ER_SDK_TIMEOUT, sdk_->Put(uris, buffers, actual));
+    EXPECT_EQ(ER_SDK_TIMEOUT, timeout_sdk.Put(uris, buffers, actual));
     EXPECT_TRUE(actual->empty());
 
-    auto get_one = sdk_->get_client_pool_->AcquireClient(0);
-    auto get_two = sdk_->get_client_pool_->AcquireClient(0);
-    auto get_three = sdk_->get_client_pool_->AcquireClient(0);
-    auto get_four = sdk_->get_client_pool_->AcquireClient(0);
+    auto get_one = timeout_sdk.get_client_pool_->AcquireClient(0);
+    auto get_two = timeout_sdk.get_client_pool_->AcquireClient(0);
+    auto get_three = timeout_sdk.get_client_pool_->AcquireClient(0);
+    auto get_four = timeout_sdk.get_client_pool_->AcquireClient(0);
     ASSERT_TRUE(get_one && get_two && get_three && get_four);
-    EXPECT_EQ(ER_SDK_TIMEOUT, sdk_->Get(uris, buffers));
-    EXPECT_EQ(0u, state_->set_calls);
-    EXPECT_EQ(0u, state_->get_calls);
+    EXPECT_EQ(ER_SDK_TIMEOUT, timeout_sdk.Get(uris, buffers));
+    EXPECT_EQ(0u, timeout_state->set_calls);
+    EXPECT_EQ(0u, timeout_state->get_calls);
 }
 
 } // namespace
