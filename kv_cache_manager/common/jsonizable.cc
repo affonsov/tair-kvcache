@@ -9,7 +9,10 @@ Jsonizable::~Jsonizable() = default;
 bool Jsonizable::Parse(rapidjson::Document &doc, const std::string &str) {
     doc.Parse(str.c_str());
     if (doc.HasParseError()) {
-        KVCM_LOG_WARN("invalid json error code [%d], str [%s]", static_cast<int>(doc.GetParseError()), str.c_str());
+        KVCM_LOG_WARN("invalid json parse error code [%d], offset [%zu], input bytes [%zu]",
+                      static_cast<int>(doc.GetParseError()),
+                      static_cast<std::size_t>(doc.GetErrorOffset()),
+                      str.size());
         return false;
     }
     return true;

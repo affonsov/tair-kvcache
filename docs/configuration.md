@@ -34,6 +34,10 @@ redis://[auth_token@]host:port/?db=<non-negative-integer>[&param=value...]
 - `db` 必须放在 query 参数中；未配置时使用 DB 0。`redis://host:port/1` 中的 `/1` 是 path，不能用于选择 DB。
 - `db > 0` 依赖 Redis 服务端支持 `SELECT`。Redis Cluster 不支持多逻辑 DB，此时应使用 DB 0，并通过 `cluster_name` 和 key 前缀隔离，或使用独立 Redis 实例。
 
+## Secure Valkey block storage
+
+Valkey data storage accepts `valkeys://host:port/?db=N` with one absolute `security_dir` reference. The mounted directory, named ACL requirements, TLS identity checks, private-network rule, compatibility behavior, and exclusions are documented in [Secure Valkey block storage](design/secure_valkey_storage.md).
+
 ## KVCacheManager Server Config
 
 ### 通用服务配置

@@ -414,3 +414,51 @@ TEST_F(StorageConfigTest, TestValkeyEndpointValidation) {
         EXPECT_NE(std::string::npos, invalid_fields.find("endpoint")) << endpoint;
     }
 }
+
+TEST_F(StorageConfigTest, TestSecureValkeyJsonRoundTripContainsOnlyEndpointAndSecurityReference) {
+    ValkeyStorageSpec spec;
+    spec.set_endpoint("valkeys://cache.internal:16379/?db=11");
+    spec.set_security_dir("/run/kvcm/valkey-security");
+    const std::string json = spec.ToJsonString();
+    EXPECT_EQ(R"({"endpoint":"valkeys://cache.internal:16379/?db=11","security_dir":"/run/kvcm/valkey-security"})",
+              json);
+    EXPECT_EQ(std::string::npos, json.find("username"));
+    EXPECT_EQ(std::string::npos, json.find("password"));
+    EXPECT_EQ("endpoint: [redacted], security_dir: [configured]", spec.ToString());
+    EXPECT_EQ(std::string::npos, spec.ToString().find(spec.security_dir()));
+
+    ValkeyStorageSpec restored;
+    ASSERT_TRUE(restored.FromJsonString(json));
+    EXPECT_EQ(spec.endpoint(), restored.endpoint());
+    EXPECT_EQ(spec.security_dir(), restored.security_dir());
+    EXPECT_TRUE(restored.secure());
+    std::string invalid_fields;
+    EXPECT_TRUE(restored.ValidateRequiredFields(invalid_fields)) << invalid_fields;
+}
+
+TEST_F(StorageConfigTest, TestValkeySchemeAndSecurityDirectoryCombinationsFailClosed) {
+    struct TestCase {
+        const char *endpoint;
+        const char *security_dir;
+        bool valid;
+    };
+    const TestCase test_cases[] = {
+        {"valkeys://cache.internal:16379/?db=11", "/run/kvcm/valkey-security", true},
+        {"valkeys://cache.internal:16379/?db=11", "", false},
+        {"valkeys://cache.internal:16379/?db=11", "relative/security", false},
+        {"valkey://cache.internal:6379/?db=11", "/run/kvcm/valkey-security", false},
+        {"redis://cache.internal:6379/?db=11", "/run/kvcm/valkey-security", false},
+        {"valkey://cache.internal:6379/?db=11", "", true},
+        {"redis://cache.internal:6379/?db=11", "", true},
+        {"valkeys://user@cache.internal:16379/?db=11", "/run/kvcm/valkey-security", false},
+        {"valkeys://cache.internal:16379/?db=11&password=", "/run/kvcm/valkey-security", false},
+        {"valkeys://cache.internal:16379/?db=11&username=", "/run/kvcm/valkey-security", false},
+    };
+    for (const TestCase &test_case : test_cases) {
+        ValkeyStorageSpec spec;
+        spec.set_endpoint(test_case.endpoint);
+        spec.set_security_dir(test_case.security_dir);
+        std::string invalid_fields;
+        EXPECT_EQ(test_case.valid, spec.ValidateRequiredFields(invalid_fields)) << test_case.endpoint;
+    }
+}

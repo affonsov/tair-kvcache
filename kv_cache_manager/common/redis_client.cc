@@ -1,25 +1,241 @@
 #include "kv_cache_manager/common/redis_client.h"
 
+#include <arpa/inet.h>
+#include <array>
 #include <cassert>
+#include <cerrno>
 #include <cstddef>
+#include <cstdint>
 #include <cstring>
+#include <fcntl.h>
+#include <hiredis_ssl.h>
 #include <limits>
+#include <mutex>
+#include <openssl/mem.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <unordered_set>
 
 #include "kv_cache_manager/common/logger.h"
-#include "unistd.h"
 
 namespace kv_cache_manager {
 
 #define KVCM_REDIS_LOG_INFO(format, ...)                                                                               \
-    KVCM_LOG_INFO("redis client addr[%s:%ld] user[%s] " format, host_.c_str(), port_, user_info_.c_str(), ##__VA_ARGS__)
+    KVCM_LOG_INFO("redis client addr[%s:%ld] " format, host_.c_str(), port_, ##__VA_ARGS__)
 #define KVCM_REDIS_LOG_WARN(format, ...)                                                                               \
-    KVCM_LOG_WARN("redis client addr[%s:%ld] user[%s] " format, host_.c_str(), port_, user_info_.c_str(), ##__VA_ARGS__)
+    KVCM_LOG_WARN("redis client addr[%s:%ld] " format, host_.c_str(), port_, ##__VA_ARGS__)
 #define KVCM_REDIS_LOG_ERROR(format, ...)                                                                              \
-    KVCM_LOG_ERROR(                                                                                                    \
-        "redis client addr[%s:%ld] user[%s] " format, host_.c_str(), port_, user_info_.c_str(), ##__VA_ARGS__)
+    KVCM_LOG_ERROR("redis client addr[%s:%ld] " format, host_.c_str(), port_, ##__VA_ARGS__)
 
 namespace {
+
+constexpr std::size_t kMaximumCaFileBytes = 1024 * 1024;
+constexpr std::size_t kMaximumUsernameFileBytes = 256;
+constexpr std::size_t kMaximumPasswordFileBytes = 4096;
+
+class ScopedFd {
+public:
+    ScopedFd() = default;
+    ~ScopedFd() {
+        if (fd_ >= 0) {
+            close(fd_);
+        }
+    }
+
+    ScopedFd(const ScopedFd &) = delete;
+    ScopedFd &operator=(const ScopedFd &) = delete;
+
+    void Reset(const int fd) { fd_ = fd; }
+    int Get() const { return fd_; }
+
+private:
+    int fd_ = -1;
+};
+
+struct FileIdentity {
+    dev_t device = 0;
+    ino_t inode = 0;
+    off_t size = 0;
+    mode_t mode = 0;
+    uid_t owner = 0;
+};
+
+void CleanseString(std::string &value) noexcept {
+    if (!value.empty()) {
+        OPENSSL_cleanse(value.data(), value.size());
+    }
+    value.clear();
+}
+
+struct Credentials {
+    ~Credentials() noexcept { Cleanse(); }
+
+    void Cleanse() noexcept {
+        CleanseString(username);
+        CleanseString(password);
+    }
+
+    std::string username;
+    std::string password;
+};
+
+RedisClient::ReplyUPtr RunAuthCommand(redisContext *context, const Credentials &credentials) {
+    static constexpr char kAuth[] = "AUTH";
+    std::array<const char *, 3> argv = {
+        kAuth,
+        credentials.username.data(),
+        credentials.password.data(),
+    };
+    const std::array<std::size_t, 3> argvlen = {
+        sizeof(kAuth) - 1,
+        credentials.username.size(),
+        credentials.password.size(),
+    };
+    return RedisClient::ReplyUPtr(static_cast<redisReply *>(redisCommandArgv(
+                                      context, static_cast<int>(argv.size()), argv.data(), argvlen.data())),
+                                  freeReplyObject);
+}
+
+bool HasTrustedOwner(const struct stat &file_stat) {
+    const uid_t effective_uid = geteuid();
+    return file_stat.st_uid == effective_uid || file_stat.st_uid == 0;
+}
+
+FileIdentity IdentityOf(const struct stat &file_stat) {
+    return {file_stat.st_dev, file_stat.st_ino, file_stat.st_size, file_stat.st_mode, file_stat.st_uid};
+}
+
+bool HasIdentity(const struct stat &file_stat, const FileIdentity &identity) {
+    return file_stat.st_dev == identity.device && file_stat.st_ino == identity.inode &&
+           file_stat.st_size == identity.size && file_stat.st_mode == identity.mode &&
+           file_stat.st_uid == identity.owner;
+}
+
+bool ValidateSecurityDirectory(const int fd, FileIdentity &identity) {
+    struct stat directory_stat {};
+    if (fstat(fd, &directory_stat) != 0 || !S_ISDIR(directory_stat.st_mode) || !HasTrustedOwner(directory_stat) ||
+        (directory_stat.st_mode & (S_IWGRP | S_IWOTH)) != 0) {
+        return false;
+    }
+    identity = IdentityOf(directory_stat);
+    return true;
+}
+
+bool ValidateSecurityFile(const int fd,
+                          const std::size_t maximum_bytes,
+                          const bool password_file,
+                          FileIdentity &identity) {
+    struct stat file_stat {};
+    if (fstat(fd, &file_stat) != 0 || !S_ISREG(file_stat.st_mode) || !HasTrustedOwner(file_stat) ||
+        file_stat.st_size <= 0 || static_cast<uint64_t>(file_stat.st_size) > maximum_bytes ||
+        (file_stat.st_mode & (S_IRUSR | S_IRGRP | S_IROTH)) == 0 ||
+        (file_stat.st_mode & (S_IWGRP | S_IXGRP | S_IWOTH | S_IXOTH)) != 0 ||
+        (password_file && (file_stat.st_mode & (S_IRWXG | S_IRWXO)) != 0)) {
+        return false;
+    }
+    identity = IdentityOf(file_stat);
+    return true;
+}
+
+bool OpenSecurityFile(const int directory_fd,
+                      const char *name,
+                      const std::size_t maximum_bytes,
+                      const bool password_file,
+                      ScopedFd &file,
+                      FileIdentity &identity) {
+    file.Reset(openat(directory_fd, name, O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK));
+    return file.Get() >= 0 && ValidateSecurityFile(file.Get(), maximum_bytes, password_file, identity);
+}
+
+bool ReadSecurityFile(const ScopedFd &file,
+                      const std::size_t maximum_bytes,
+                      const bool password_file,
+                      const FileIdentity &identity,
+                      std::string &contents) {
+    CleanseString(contents);
+    if (identity.size <= 0 || static_cast<uint64_t>(identity.size) > maximum_bytes) {
+        return false;
+    }
+    contents.resize(static_cast<std::size_t>(identity.size));
+    std::size_t offset = 0;
+    while (offset < contents.size()) {
+        const ssize_t read_size =
+            pread(file.Get(), contents.data() + offset, contents.size() - offset, static_cast<off_t>(offset));
+        if (read_size > 0) {
+            offset += static_cast<std::size_t>(read_size);
+        } else if (read_size < 0 && errno == EINTR) {
+            continue;
+        } else {
+            CleanseString(contents);
+            return false;
+        }
+    }
+
+    FileIdentity final_identity;
+    if (!ValidateSecurityFile(file.Get(), maximum_bytes, password_file, final_identity) ||
+        final_identity.device != identity.device || final_identity.inode != identity.inode ||
+        final_identity.size != identity.size || final_identity.mode != identity.mode ||
+        final_identity.owner != identity.owner) {
+        CleanseString(contents);
+        return false;
+    }
+    return true;
+}
+
+bool GetStableFileDescriptorPath(const int fd, const FileIdentity &identity, std::string &path) {
+    for (const char *prefix : {"/proc/self/fd/", "/dev/fd/"}) {
+        path = prefix + std::to_string(fd);
+        const int reopened_fd = open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK);
+        if (reopened_fd < 0) {
+            continue;
+        }
+        struct stat reopened_stat {};
+        const bool matches = fstat(reopened_fd, &reopened_stat) == 0 && HasIdentity(reopened_stat, identity);
+        close(reopened_fd);
+        if (matches) {
+            return true;
+        }
+    }
+    path.clear();
+    return false;
+}
+
+bool NormalizeCredentialFile(std::string &value, const bool username) {
+    if (!value.empty() && value.back() == '\n') {
+        value.pop_back();
+        if (!value.empty() && value.back() == '\r') {
+            value.pop_back();
+        }
+    }
+    if (value.empty()) {
+        return false;
+    }
+    for (const unsigned char ch : value) {
+        if (ch == '\0' || ch == '\r' || ch == '\n' || (username && (ch <= 0x20 || ch == 0x7f))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool IsIpAddress(const std::string &host) {
+    std::array<unsigned char, sizeof(struct in6_addr)> address{};
+    return inet_pton(AF_INET, host.c_str(), address.data()) == 1 ||
+           inet_pton(AF_INET6, host.c_str(), address.data()) == 1;
+}
+
+bool IsExactStatus(const redisReply *reply, const char *expected) {
+    const std::size_t expected_size = std::strlen(expected);
+    return reply != nullptr && reply->type == REDIS_REPLY_STATUS && reply->str != nullptr &&
+           reply->len == expected_size && std::memcmp(reply->str, expected, expected_size) == 0;
+}
+
+bool InitializeRedisTls() {
+    static std::once_flag initialization_once;
+    static bool initialized = false;
+    std::call_once(initialization_once, [] { initialized = redisInitOpenSSL() == REDIS_OK; });
+    return initialized;
+}
 
 // Cap per-pipeline hiredis command/reply bookkeeping while retaining useful
 // batching for Valkey block transfers.
@@ -66,24 +282,32 @@ std::size_t StringPipelineChunkEnd(const std::size_t item_count,
 } // namespace
 
 RedisClient::RedisClient(const StandardUri &storage_uri)
-    : user_info_(storage_uri.GetUserInfo()), host_(storage_uri.GetHostName()), port_(storage_uri.GetPort()) {
+    : RedisClient(RedisConnectionOptions{storage_uri, RedisSecurityOptions{}}) {}
+
+RedisClient::RedisClient(const RedisConnectionOptions &options)
+    : user_info_(options.endpoint.GetUserInfo())
+    , protocol_(options.endpoint.GetProtocol())
+    , host_(options.endpoint.GetHostName())
+    , security_directory_(options.security.directory)
+    , transport_security_(options.security.transport)
+    , port_(options.endpoint.GetPort()) {
     int64_t tmp_db = 0;
-    storage_uri.GetParamAs("db", tmp_db);
+    options.endpoint.GetParamAs("db", tmp_db);
     if (tmp_db >= 0) {
         db_ = tmp_db;
     }
     int64_t tmp_timeout_ms = 0;
-    storage_uri.GetParamAs("timeout_ms", tmp_timeout_ms);
+    options.endpoint.GetParamAs("timeout_ms", tmp_timeout_ms);
     if (tmp_timeout_ms > 0) {
         timeout_ms_ = tmp_timeout_ms;
     }
     int64_t tmp_retry_count = 0;
-    storage_uri.GetParamAs("retry_count", tmp_retry_count);
+    options.endpoint.GetParamAs("retry_count", tmp_retry_count);
     if (tmp_retry_count > 0) {
         retry_count_ = tmp_retry_count;
     }
     int64_t tmp_randomkey_batch_num = 0;
-    storage_uri.GetParamAs("randomkey_batch_num", tmp_randomkey_batch_num);
+    options.endpoint.GetParamAs("randomkey_batch_num", tmp_randomkey_batch_num);
     if (tmp_randomkey_batch_num > 0) {
         randomkey_batch_num_ = tmp_randomkey_batch_num;
     }
@@ -149,19 +373,38 @@ bool RedisClient::GetReplyStrOrNil(const redisReply *reply, std::string &out_str
     return true;
 }
 
-bool RedisClient::Connect() {
-    Disconnect();
-
-    struct timeval timeout;
+bool RedisClient::SetSocketTimeout() {
+    struct timeval timeout {};
     timeout.tv_sec = timeout_ms_ / 1000;
     timeout.tv_usec = (timeout_ms_ % 1000) * 1000;
-    context_ = redisConnectWithTimeout(host_.c_str(), port_, timeout);
-    if (!IsContextOk()) {
-        KVCM_REDIS_LOG_WARN("fail to connect to redis");
+    if (redisSetTimeout(context_, timeout) != REDIS_OK) {
+        KVCM_REDIS_LOG_WARN("failed to configure blocking socket timeout");
+        return false;
+    }
+    return true;
+}
+
+RedisClient::ReplyUPtr RedisClient::RunCommand(const CmdArgs &command) {
+    std::vector<const char *> argv;
+    std::vector<std::size_t> argvlen;
+    argv.reserve(command.size());
+    argvlen.reserve(command.size());
+    for (const std::string &argument : command) {
+        argv.push_back(argument.data());
+        argvlen.push_back(argument.size());
+    }
+    return ReplyUPtr(static_cast<redisReply *>(
+                         redisCommandArgv(context_, static_cast<int>(argv.size()), argv.data(), argvlen.data())),
+                     freeReplyObject);
+}
+
+bool RedisClient::ConnectPlaintext() {
+    if (protocol_ == "valkeys" || !security_directory_.empty()) {
+        KVCM_REDIS_LOG_WARN("plaintext connection options are invalid");
         return false;
     }
 
-    ReplyUPtr ping_reply_1((redisReply *)redisCommand(context_, "PING"), freeReplyObject);
+    ReplyUPtr ping_reply_1(static_cast<redisReply *>(redisCommand(context_, "PING")), freeReplyObject);
     if (!ping_reply_1) {
         KVCM_REDIS_LOG_WARN("want to ping first to check if auth needed, but ping fail, get nullptr reply");
         return false;
@@ -173,13 +416,13 @@ bool RedisClient::Connect() {
         std::string error_str(ping_reply_1->str);
         static const std::string auth_str = "NOAUTH";
         if (error_str.size() >= auth_str.size() && error_str.compare(0, auth_str.size(), auth_str.c_str()) == 0) {
-            // do auth
-            ReplyUPtr auth_reply((redisReply *)redisCommand(context_, "AUTH %s", user_info_.c_str()), freeReplyObject);
+            ReplyUPtr auth_reply(static_cast<redisReply *>(redisCommand(context_, "AUTH %s", user_info_.c_str())),
+                                 freeReplyObject);
             if (!IsReplyOk(auth_reply.get())) {
                 KVCM_REDIS_LOG_WARN("auth fail");
                 return false;
             }
-            ReplyUPtr ping_reply_2((redisReply *)redisCommand(context_, "PING"), freeReplyObject);
+            ReplyUPtr ping_reply_2(static_cast<redisReply *>(redisCommand(context_, "PING")), freeReplyObject);
             if (!IsReplyOk(ping_reply_2.get())) {
                 KVCM_REDIS_LOG_WARN("ping fail after auth");
                 return false;
@@ -192,11 +435,141 @@ bool RedisClient::Connect() {
     }
 
     if (db_ > 0) {
-        ReplyUPtr select_reply((redisReply *)redisCommand(context_, "SELECT %ld", db_), freeReplyObject);
+        ReplyUPtr select_reply(static_cast<redisReply *>(redisCommand(context_, "SELECT %ld", db_)), freeReplyObject);
         if (!IsReplyOk(select_reply.get())) {
             KVCM_REDIS_LOG_WARN("fail to select redis db[%ld]", db_);
             return false;
         }
+    }
+    return true;
+}
+
+bool RedisClient::ConnectSecure() {
+    Credentials credentials;
+    if (protocol_ != "valkeys" || !user_info_.empty() || security_directory_.empty() ||
+        security_directory_.front() != '/' || security_directory_.find('\0') != std::string::npos) {
+        KVCM_REDIS_LOG_WARN("secure connection options are invalid");
+        return false;
+    }
+
+    std::string directory_path = security_directory_;
+    while (directory_path.size() > 1 && directory_path.back() == '/') {
+        directory_path.pop_back();
+    }
+    ScopedFd directory;
+    directory.Reset(open(directory_path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW));
+    FileIdentity directory_identity;
+    if (directory.Get() < 0 || !ValidateSecurityDirectory(directory.Get(), directory_identity)) {
+        KVCM_REDIS_LOG_WARN("secure connection directory does not satisfy the trust policy");
+        return false;
+    }
+
+    ScopedFd ca_file;
+    ScopedFd username_file;
+    ScopedFd password_file;
+    FileIdentity ca_identity;
+    FileIdentity username_identity;
+    FileIdentity password_identity;
+    if (!OpenSecurityFile(directory.Get(), "ca.pem", kMaximumCaFileBytes, false, ca_file, ca_identity) ||
+        !OpenSecurityFile(
+            directory.Get(), "username", kMaximumUsernameFileBytes, false, username_file, username_identity) ||
+        !OpenSecurityFile(
+            directory.Get(), "password", kMaximumPasswordFileBytes, true, password_file, password_identity) ||
+        !ReadSecurityFile(username_file, kMaximumUsernameFileBytes, false, username_identity, credentials.username) ||
+        !ReadSecurityFile(password_file, kMaximumPasswordFileBytes, true, password_identity, credentials.password) ||
+        !NormalizeCredentialFile(credentials.username, true) || !NormalizeCredentialFile(credentials.password, false)) {
+        KVCM_REDIS_LOG_WARN("secure connection material does not satisfy the trust policy");
+        return false;
+    }
+
+    std::string stable_ca_path;
+    if (!GetStableFileDescriptorPath(ca_file.Get(), ca_identity, stable_ca_path)) {
+        KVCM_REDIS_LOG_WARN("secure connection cannot pin the validated CA file");
+        return false;
+    }
+    if (!InitializeRedisTls()) {
+        KVCM_REDIS_LOG_WARN("failed to initialize TLS support");
+        return false;
+    }
+    redisSSLOptions ssl_options{};
+    ssl_options.cacert_filename = stable_ca_path.c_str();
+    ssl_options.verify_mode = REDIS_SSL_VERIFY_PEER;
+    ssl_options.verify_name = host_.c_str();
+    if (!IsIpAddress(host_)) {
+        ssl_options.server_name = host_.c_str();
+    }
+    redisSSLContextError ssl_error = REDIS_SSL_CTX_NONE;
+    redisSSLContext *ssl_context = redisCreateSSLContextWithOptions(&ssl_options, &ssl_error);
+
+    struct stat final_directory_stat {};
+    struct stat final_ca_stat {};
+    const bool material_stable = fstat(directory.Get(), &final_directory_stat) == 0 &&
+                                 HasIdentity(final_directory_stat, directory_identity) &&
+                                 fstat(ca_file.Get(), &final_ca_stat) == 0 && HasIdentity(final_ca_stat, ca_identity);
+    if (ssl_context == nullptr || ssl_error != REDIS_SSL_CTX_NONE || !material_stable) {
+        if (ssl_context != nullptr) {
+            redisFreeSSLContext(ssl_context);
+        }
+        KVCM_REDIS_LOG_WARN("failed to create a TLS context from stable validated trust material");
+        return false;
+    }
+    const int initiate_result = redisInitiateSSLWithContext(context_, ssl_context);
+    redisFreeSSLContext(ssl_context);
+    if (initiate_result != REDIS_OK || !IsContextOk()) {
+        KVCM_REDIS_LOG_WARN("TLS handshake or peer identity verification failed");
+        return false;
+    }
+
+    const ReplyUPtr auth_reply = RunAuthCommand(context_, credentials);
+    credentials.Cleanse();
+    if (!IsExactStatus(auth_reply.get(), "OK")) {
+        KVCM_REDIS_LOG_WARN("named ACL authentication failed");
+        return false;
+    }
+    const ReplyUPtr select_reply = RunCommand({"SELECT", std::to_string(db_)});
+    if (!IsExactStatus(select_reply.get(), "OK")) {
+        KVCM_REDIS_LOG_WARN("secure connection failed to select redis db[%ld]", db_);
+        return false;
+    }
+    const ReplyUPtr ping_reply = RunCommand({"PING"});
+    if (!IsExactStatus(ping_reply.get(), "PONG")) {
+        KVCM_REDIS_LOG_WARN("secure connection ping failed after authentication and database selection");
+        return false;
+    }
+    return true;
+}
+
+bool RedisClient::Connect() {
+    Disconnect();
+
+    struct timeval connect_timeout {};
+    connect_timeout.tv_sec = timeout_ms_ / 1000;
+    connect_timeout.tv_usec = (timeout_ms_ % 1000) * 1000;
+    context_ = redisConnectWithTimeout(host_.c_str(), port_, connect_timeout);
+    if (!IsContextOk()) {
+        KVCM_REDIS_LOG_WARN("fail to connect to redis");
+        if (transport_security_ == RedisTransportSecurity::TLS_NAMED_ACL) {
+            Disconnect();
+        }
+        return false;
+    }
+    bool initialized = false;
+    switch (transport_security_) {
+    case RedisTransportSecurity::PLAINTEXT:
+        initialized = ConnectPlaintext();
+        break;
+    case RedisTransportSecurity::TLS_NAMED_ACL:
+        initialized = SetSocketTimeout() && ConnectSecure();
+        break;
+    default:
+        KVCM_REDIS_LOG_WARN("unsupported transport security mode");
+        break;
+    }
+    if (!initialized) {
+        if (transport_security_ == RedisTransportSecurity::TLS_NAMED_ACL) {
+            Disconnect();
+        }
+        return false;
     }
 
     KVCM_REDIS_LOG_INFO("connect to redis db[%ld] timeout_ms[%ld] retry_count[%ld]", db_, timeout_ms_, retry_count_);

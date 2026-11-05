@@ -276,7 +276,7 @@ std::pair<ClientErrorCode, std::string> GrpcStub::RegisterInstance(const std::st
     auto grpc_status = stub->RegisterInstance(&context, request, &response);
     CHECK_GRPC_STATUS_WITH_TYPE(grpc_status);
     CHECK_COMMON_HEADER_WITH_TYPE(response);
-    KVCM_LOG_DEBUG("register instance success, storage_config: %s", response.storage_configs().c_str());
+    KVCM_LOG_DEBUG("register instance success, storage_config_bytes: %zu", response.storage_configs().size());
     return {ER_OK, response.storage_configs()};
 }
 

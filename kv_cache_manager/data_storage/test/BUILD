@@ -116,6 +116,7 @@ cc_test(
     deps = [
         "//kv_cache_manager/common:redis_client",
         "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/common/test:secure_valkey_test_environment",
         "//kv_cache_manager/data_storage:valkey_backend",
         "//kv_cache_manager/data_storage:valkey_uri_util",
         "//kv_cache_manager/metrics:metrics_registry",

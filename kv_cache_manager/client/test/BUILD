@@ -28,6 +28,21 @@ cc_test(
     ],
 )
 
+py_test(
+    name = "secure_valkey_source_test",
+    size = "small",
+    srcs = ["secure_valkey_source_test.py"],
+    data = [
+        "//kv_cache_manager/client:src/transfer_client_impl.cc",
+        "//kv_cache_manager/client/src/internal/sdk:sdk_wrapper.cc",
+        "//kv_cache_manager/client/src/internal/stub:grpc_stub.cc",
+        "//kv_cache_manager/common:jsonizable.cc",
+        "//kv_cache_manager/common:redis_client.cc",
+        "//kv_cache_manager/manager:cache_manager.cc",
+        "//kv_cache_manager/manager:startup_config_loader.cc",
+    ],
+)
+
 cc_test(
     name = "valkey_transfer_client_real_service_test",
     srcs = ["valkey_transfer_client_real_service_test.cc"],
@@ -38,6 +53,7 @@ cc_test(
     deps = [
         "//kv_cache_manager/client",
         "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/common/test:secure_valkey_test_environment",
         "//kv_cache_manager/data_storage",
         "//kv_cache_manager/metrics:metrics_registry",
         "//kv_cache_manager/protocol/protobuf:service_cc_proto",

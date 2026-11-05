@@ -87,11 +87,11 @@ ClientErrorCode TransferClientImpl::InitInternal(const std::string &client_confi
         }
         sdk_wrapper_ = std::make_unique<SdkWrapper>();
         KVCM_LOG_INFO("transfer client init params: role_type[%d], regist_span[%p], self_location_spec_name[%s], "
-                      "storage_configs[%s]",
+                      "storage_configs_bytes[%zu]",
                       static_cast<int>(init_params_.role_type),
                       init_params_.regist_span,
                       init_params_.self_location_spec_name.c_str(),
-                      init_params_.storage_configs.c_str());
+                      init_params_.storage_configs.size());
         ec = sdk_wrapper_->Init(client_config_, init_params_, memory_registrations);
         if (ec != ER_OK) {
             KVCM_LOG_ERROR("init sdk wrapper failed");
