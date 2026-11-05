@@ -672,13 +672,23 @@ TEST_F(DataStorageSelectorTest, TestEventReportUsageDoesNotConsumeGroupQuota) {
 }
 
 TEST_F(DataStorageSelectorTest, TestValkeyUsesDefaultEligibilityAndHonorsZeroQuota) {
+    const auto valkey_spec = std::make_shared<ValkeyStorageSpec>();
+    valkey_spec->set_endpoint("valkey://127.0.0.1:6379/?db=0");
     const auto valkey = std::make_shared<ValkeyDataStorageBackend>(metrics_registry_);
-    valkey->config_ = StorageConfig(DataStorageType::DATA_STORAGE_TYPE_VALKEY, "valkey_storage_00", nullptr);
+    valkey->config_ = StorageConfig(DataStorageType::DATA_STORAGE_TYPE_VALKEY, "valkey_storage_00", valkey_spec);
     valkey->is_open_ = true;
     valkey->is_available_ = true;
-    avail_backends_g = {valkey};
 
-    instance_group_g->set_storage_candidates({"valkey_storage_00"});
+    const auto nfs_spec = std::make_shared<NfsStorageSpec>();
+    nfs_spec->set_root_path("/tmp/kv_cache_manager_selector_test");
+    nfs_spec->set_key_count_per_file(1);
+    const auto nfs = std::make_shared<NfsBackend>(metrics_registry_);
+    nfs->config_ = StorageConfig(DataStorageType::DATA_STORAGE_TYPE_NFS, "nfs_storage_00", nfs_spec);
+    nfs->is_open_ = true;
+    nfs->is_available_ = true;
+    avail_backends_g = {valkey, nfs};
+
+    instance_group_g->set_storage_candidates({"valkey_storage_00", "nfs_storage_00"});
     instance_group_g->cache_config_->set_cache_prefer_strategy(CachePreferStrategy::CPS_UNSPECIFIED);
     InstanceGroupQuota quota;
     quota.set_capacity(1024);
@@ -693,7 +703,9 @@ TEST_F(DataStorageSelectorTest, TestValkeyUsesDefaultEligibilityAndHonorsZeroQuo
     quota.set_quota_config({QuotaConfig(0, DataStorageType::DATA_STORAGE_TYPE_VALKEY)});
     instance_group_g->set_quota(quota);
     result = data_storage_selector_->SelectCacheWriteDataStorageBackend(request_context_.get(), "default_test_group");
-    EXPECT_NE(ErrorCode::EC_OK, result.ec);
+    ASSERT_EQ(ErrorCode::EC_OK, result.ec);
+    EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_NFS, result.type);
+    EXPECT_EQ("nfs_storage_00", result.name);
 }
 
 TEST_F(DataStorageSelectorTest, TestExplicitWriteTargetAdmissionChecksAvailabilityAndQuota) {
