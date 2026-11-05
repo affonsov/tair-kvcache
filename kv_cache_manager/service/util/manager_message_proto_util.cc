@@ -67,6 +67,10 @@ void ProtoConvert::StorageConfigToProto(const StorageConfig &storage_config,
         auto *dummy = proto_storage_config->mutable_dummy();
         dummy->set_root_path(dummy_storage.root_path());
         dummy->set_key_count_per_file(dummy_storage.key_count_per_file());
+    } else if (type == DataStorageType::DATA_STORAGE_TYPE_VALKEY) {
+        const auto &valkey_storage = *std::dynamic_pointer_cast<ValkeyStorageSpec>(storage_config.storage_spec());
+        proto_storage_config->mutable_valkey()->set_endpoint(valkey_storage.endpoint());
+        proto_storage_config->set_storage_type(proto::admin::ST_VALKEY);
     } else if (IsEventReportStorageType(type)) {
         const auto &er_spec = *std::dynamic_pointer_cast<EventReportStorageSpec>(storage_config.storage_spec());
         proto::admin::EventReportStorageSpec *spec = proto_storage_config->mutable_event_report();
@@ -169,6 +173,13 @@ void ProtoConvert::StorageFromProto(const proto::admin::StorageConfig *proto_sto
         spec.set_key_count_per_file(proto_storage_config->dummy().key_count_per_file());
         storage_config.set_storage_spec(std::make_shared<DummyStorageSpec>(spec));
         storage_config.set_type(DataStorageType::DATA_STORAGE_TYPE_DUMMY);
+        break;
+    }
+    case proto::admin::StorageConfig::kValkey: {
+        ValkeyStorageSpec spec;
+        spec.set_endpoint(proto_storage_config->valkey().endpoint());
+        storage_config.set_storage_spec(std::make_shared<ValkeyStorageSpec>(spec));
+        storage_config.set_type(DataStorageType::DATA_STORAGE_TYPE_VALKEY);
         break;
     }
     case proto::admin::StorageConfig::kEventReport: {

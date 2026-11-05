@@ -68,7 +68,6 @@ cc_library(
     srcs = [
         "local_file_sdk.cc",
         "sdk_factory.cc",
-        "sdk_interface.cc",
         "sdk_wrapper.cc",
     ] + select({
         ":enable_mooncake": [
@@ -109,6 +108,8 @@ cc_library(
     }),
     deps = [
         ":lock_free_thread_pool",
+        ":sdk_common",
+        ":valkey_sdk",
         "//kv_cache_manager/client:common",
         "//kv_cache_manager/client/src/internal/config",
         "//kv_cache_manager/client/src/internal/util",

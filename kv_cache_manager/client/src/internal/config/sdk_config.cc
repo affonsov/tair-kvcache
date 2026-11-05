@@ -123,6 +123,8 @@ void NfsSdkConfig::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &wri
     SdkBackendConfig::ToRapidWriter(writer);
 }
 
+ValkeySdkConfig::ValkeySdkConfig() { set_type(DataStorageType::DATA_STORAGE_TYPE_VALKEY); }
+
 bool SdkWrapperConfig::FromRapidValue(const rapidjson::Value &rapid_value) {
     KVCM_JSON_GET_MACRO(rapid_value, "thread_num", thread_num_);
     KVCM_JSON_GET_MACRO(rapid_value, "queue_size", queue_size_);
@@ -151,6 +153,9 @@ bool SdkWrapperConfig::FromRapidValue(const rapidjson::Value &rapid_value) {
                 break;
             case DataStorageType::DATA_STORAGE_TYPE_NFS:
                 sdk_backend_config = std::make_shared<NfsSdkConfig>();
+                break;
+            case DataStorageType::DATA_STORAGE_TYPE_VALKEY:
+                sdk_backend_config = std::make_shared<ValkeySdkConfig>();
                 break;
             default:
                 break;

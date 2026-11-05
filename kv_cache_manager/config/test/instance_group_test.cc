@@ -243,9 +243,62 @@ TEST_F(InstanceGroupTest, EventReportStorageSpecProtoRoundTripPreservesSnapshotS
     EXPECT_NE(std::string::npos, invalid_fields.find("snapshot_delta_drain_timeout_ms"));
 }
 
+TEST_F(InstanceGroupTest, ValkeyStorageProtoRoundTripPreservesEndpointAndAvailabilityCheck) {
+    auto spec = std::make_shared<ValkeyStorageSpec>();
+    spec->set_endpoint("valkey://127.0.0.1:6379/?db=7");
+    StorageConfig original(DataStorageType::DATA_STORAGE_TYPE_VALKEY, "valkey_1", spec);
+    original.set_check_storage_available_when_open(true);
+
+    proto::admin::StorageConfig proto_config;
+    ProtoConvert::StorageConfigToProto(original, &proto_config);
+    ASSERT_TRUE(proto_config.has_valkey());
+    EXPECT_EQ("valkey_1", proto_config.global_unique_name());
+    EXPECT_TRUE(proto_config.check_storage_available_when_open());
+    EXPECT_EQ(proto::admin::ST_VALKEY, proto_config.storage_type());
+    EXPECT_EQ("valkey://127.0.0.1:6379/?db=7", proto_config.valkey().endpoint());
+
+    StorageConfig restored;
+    ProtoConvert::StorageFromProto(&proto_config, restored);
+    EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_VALKEY, restored.type());
+    EXPECT_EQ("valkey_1", restored.global_unique_name());
+    EXPECT_TRUE(restored.check_storage_available_when_open());
+    const auto restored_spec = std::dynamic_pointer_cast<ValkeyStorageSpec>(restored.storage_spec());
+    ASSERT_NE(nullptr, restored_spec);
+    EXPECT_EQ("valkey://127.0.0.1:6379/?db=7", restored_spec->endpoint());
+    std::string invalid_fields;
+    EXPECT_TRUE(restored.ValidateRequiredFields(invalid_fields));
+
+    proto_config.mutable_valkey()->set_endpoint("valkey://not-a-connection-endpoint");
+    StorageConfig invalid;
+    ProtoConvert::StorageFromProto(&proto_config, invalid);
+    invalid_fields.clear();
+    EXPECT_FALSE(invalid.ValidateRequiredFields(invalid_fields));
+    EXPECT_NE(std::string::npos, invalid_fields.find("endpoint"));
+}
+
+TEST_F(InstanceGroupTest, ValkeyStorageTypeConvertsForAdminAndMetaProtocols) {
+    proto::admin::StorageType admin_type = proto::admin::ST_UNSPECIFIED;
+    ProtoConvert::DataStorageTypeToProto(DataStorageType::DATA_STORAGE_TYPE_VALKEY, &admin_type);
+    EXPECT_EQ(proto::admin::ST_VALKEY, admin_type);
+    DataStorageType internal_type = DataStorageType::DATA_STORAGE_TYPE_UNKNOWN;
+    ProtoConvert::DataStorageTypeFromProto(proto::admin::ST_VALKEY, internal_type);
+    EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_VALKEY, internal_type);
+
+    proto::meta::StorageType meta_type = proto::meta::ST_UNSPECIFIED;
+    ProtoConvert::DataStorageTypeToProto(DataStorageType::DATA_STORAGE_TYPE_VALKEY, &meta_type);
+    EXPECT_EQ(proto::meta::ST_VALKEY, meta_type);
+    internal_type = DataStorageType::DATA_STORAGE_TYPE_UNKNOWN;
+    ProtoConvert::DataStorageTypeFromProto(proto::meta::ST_VALKEY, internal_type);
+    EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_VALKEY, internal_type);
+}
+
 TEST_F(InstanceGroupTest, UnknownProtoStorageTypeFailsClosed) {
     DataStorageType storage_type = DataStorageType::DATA_STORAGE_TYPE_NFS;
     ProtoConvert::DataStorageTypeFromProto(static_cast<proto::admin::StorageType>(263), storage_type);
+    EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_UNKNOWN, storage_type);
+
+    storage_type = DataStorageType::DATA_STORAGE_TYPE_VALKEY;
+    ProtoConvert::DataStorageTypeFromProto(static_cast<proto::meta::StorageType>(263), storage_type);
     EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_UNKNOWN, storage_type);
 
     proto::admin::CacheLocation proto_location;

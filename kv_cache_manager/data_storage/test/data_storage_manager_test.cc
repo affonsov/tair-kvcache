@@ -3,6 +3,7 @@
 
 #include "kv_cache_manager/common/unittest.h"
 #include "kv_cache_manager/data_storage/data_storage_manager.h"
+#include "kv_cache_manager/data_storage/valkey_backend.h"
 #include "kv_cache_manager/metrics/metrics_registry.h"
 
 using namespace kv_cache_manager;
@@ -113,6 +114,18 @@ TEST_F(DataStorageManagerTest, TestOptionalBackendsFollowBuildConfig) {
     // while the internal PACE backend can initialize successfully.
     pace_ssd_backend->config_ = pace_ssd_config;
     EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD, pace_ssd_backend->GetType());
+}
+
+TEST_F(DataStorageManagerTest, TestValkeyBackendIsAlwaysConstructible) {
+    DataStorageManager data_storage_manager(metrics_registry_);
+
+    const auto backend = data_storage_manager.CreateStorageBackend(DataStorageType::DATA_STORAGE_TYPE_VALKEY);
+    ASSERT_NE(nullptr, backend);
+    EXPECT_NE(nullptr, std::dynamic_pointer_cast<ValkeyDataStorageBackend>(backend));
+    EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_VALKEY, backend->GetType());
+
+    EXPECT_EQ(nullptr, data_storage_manager.CreateStorageBackend(DataStorageType::DATA_STORAGE_TYPE_UNKNOWN));
+    EXPECT_EQ(nullptr, data_storage_manager.CreateStorageBackend(static_cast<DataStorageType>(255)));
 }
 
 TEST_F(DataStorageManagerTest, TestConfirmedMissingDeletePolicies) {

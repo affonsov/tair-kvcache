@@ -28,6 +28,23 @@ cc_test(
     ],
 )
 
+cc_test(
+    name = "valkey_transfer_client_real_service_test",
+    srcs = ["valkey_transfer_client_real_service_test.cc"],
+    tags = [
+        "manual",
+        "valkey",
+    ],
+    deps = [
+        "//kv_cache_manager/client",
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/data_storage",
+        "//kv_cache_manager/metrics:metrics_registry",
+        "//kv_cache_manager/protocol/protobuf:service_cc_proto",
+        "//kv_cache_manager/service/util:manager_message_proto_util",
+    ],
+)
+
 py_binary(
     name = "asan_runner",
     srcs = ["asan_runner.py"],

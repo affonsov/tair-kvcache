@@ -54,6 +54,7 @@ private:
     // slot 5: DATA_STORAGE_TYPE_VCNS_HF3FS **UNUSED** (merged into HF3FS)
     // slot 6: DATA_STORAGE_TYPE_DUMMY availability flag (testing only)
     // slot 9: DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD availability flag
+    // slot 10: DATA_STORAGE_TYPE_VALKEY availability flag
     array_t_ storage_quota_avail_by_type_;
 };
 
@@ -65,6 +66,7 @@ DataStorageSelector::StorageQuotaAvail::StorageQuotaAvail() : storage_quota_avai
     storage_quota_avail_by_type_.at(ToIndex(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD)) = true;
     storage_quota_avail_by_type_.at(ToIndex(DataStorageType::DATA_STORAGE_TYPE_NFS)) = true;
     storage_quota_avail_by_type_.at(ToIndex(DataStorageType::DATA_STORAGE_TYPE_DUMMY)) = true;
+    storage_quota_avail_by_type_.at(ToIndex(DataStorageType::DATA_STORAGE_TYPE_VALKEY)) = true;
 }
 
 bool DataStorageSelector::StorageQuotaAvail::GetStorageQuotaAvailByType(const DataStorageType &type) const noexcept {
