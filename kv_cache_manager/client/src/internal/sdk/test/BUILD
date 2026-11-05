@@ -16,6 +16,34 @@ config_setting(
 )
 
 cc_test(
+    name = "ValkeySdkTest",
+    srcs = ["valkey_sdk_test.cc"],
+    copts = ["-fno-access-control"],
+    deps = [
+        "//kv_cache_manager/client/src/internal/config",
+        "//kv_cache_manager/client/src/internal/sdk:valkey_sdk",
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/data_storage:valkey_uri_util",
+    ],
+)
+
+cc_test(
+    name = "valkey_sdk_real_service_test",
+    srcs = ["valkey_sdk_real_service_test.cc"],
+    tags = [
+        "manual",
+        "valkey",
+    ],
+    deps = [
+        "//kv_cache_manager/client/src/internal/config",
+        "//kv_cache_manager/client/src/internal/sdk:valkey_sdk",
+        "//kv_cache_manager/common:redis_client",
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/data_storage:valkey_uri_util",
+    ],
+)
+
+cc_test(
     name = "LocalFileSdkTest",
     srcs = [
         "local_file_sdk_test.cc",
