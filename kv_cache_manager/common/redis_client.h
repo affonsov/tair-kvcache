@@ -23,6 +23,8 @@ public:
 
     bool Open();
     void Close();
+    std::vector<ErrorCode> SetStrings(const std::vector<std::string> &keys, const std::vector<std::string> &values);
+    std::vector<ErrorCode> GetStrings(const std::vector<std::string> &keys, std::vector<std::string> &out_values);
     std::vector<ErrorCode> Set(const std::vector<std::string> &keys,
                                const std::vector<std::map<std::string, std::string>> &field_maps);
     std::vector<ErrorCode> Update(const std::vector<std::string> &keys,

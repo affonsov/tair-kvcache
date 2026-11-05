@@ -21,6 +21,7 @@ enum class DataStorageType : uint8_t {
     // Keep the legacy TairMempool type for DRAM/backward compatibility and
     // account explicit SSD locations independently for quota and water level.
     DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD = 9,
+    DATA_STORAGE_TYPE_VALKEY = 10,
     COUNT, // as sentinel, must be last
 };
 
@@ -231,6 +232,20 @@ public:
 private:
     std::string root_path_;
     int32_t key_count_per_file_ = 0;
+};
+
+class ValkeyStorageSpec : public StorageSpec {
+public:
+    bool FromRapidValue(const rapidjson::Value &rapid_value) override;
+    void ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept override;
+    bool ValidateRequiredFields(std::string &invalid_fields) const override;
+    std::string ToString() const override;
+
+    const std::string &endpoint() const { return endpoint_; }
+    void set_endpoint(const std::string &endpoint) { endpoint_ = endpoint; }
+
+private:
+    std::string endpoint_;
 };
 
 class EventReportStorageSpec : public StorageSpec {
