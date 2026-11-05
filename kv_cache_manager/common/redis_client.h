@@ -11,15 +11,31 @@
 
 namespace kv_cache_manager {
 
+enum class RedisTransportSecurity {
+    PLAINTEXT,
+    TLS_NAMED_ACL,
+};
+
+struct RedisSecurityOptions {
+    RedisTransportSecurity transport = RedisTransportSecurity::PLAINTEXT;
+    std::string directory;
+};
+
+struct RedisConnectionOptions {
+    StandardUri endpoint;
+    RedisSecurityOptions security;
+};
+
 class RedisClient {
 public:
     RedisClient(const StandardUri &storage_uri);
+    RedisClient(const RedisConnectionOptions &options);
     virtual ~RedisClient(); // virtual for test
 
     RedisClient(const RedisClient &) = delete;
     RedisClient &operator=(const RedisClient &) = delete;
-    RedisClient(RedisClient &&) = default;
-    RedisClient &operator=(RedisClient &&) = default;
+    RedisClient(RedisClient &&) = delete;
+    RedisClient &operator=(RedisClient &&) = delete;
 
     bool Open();
     void Close();
@@ -103,9 +119,17 @@ protected:
     virtual std::vector<ReplyUPtr> TryExecPipeline(const std::vector<CmdArgs> &cmds);
 
 private:
+    bool ConnectPlaintext();
+    bool ConnectSecure();
+    bool SetSocketTimeout();
+    ReplyUPtr RunCommand(const CmdArgs &command);
+
     redisContext *context_ = nullptr;
     std::string user_info_;
+    std::string protocol_;
     std::string host_;
+    std::string security_directory_;
+    RedisTransportSecurity transport_security_ = RedisTransportSecurity::PLAINTEXT;
     int64_t port_ = 0;
     int64_t db_ = 0;
     int64_t timeout_ms_ = 2000;

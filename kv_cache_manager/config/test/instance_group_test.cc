@@ -504,3 +504,42 @@ TEST_F(InstanceGroupTest, TairMempoolHealthTimeoutProtoDefaultsAndRoundTrip) {
     EXPECT_NE(std::string::npos, invalid_fields.find("health_check_timeout"));
 }
 } // namespace kv_cache_manager
+
+namespace kv_cache_manager {
+
+TEST_F(InstanceGroupTest, SecureValkeyAdminAndMetaProtoRoundTripsPreserveOnlyReferences) {
+    auto spec = std::make_shared<ValkeyStorageSpec>();
+    spec->set_endpoint("valkeys://cache.internal:16379/?db=7");
+    spec->set_security_dir("/run/kvcm/valkey-security");
+    StorageConfig original(DataStorageType::DATA_STORAGE_TYPE_VALKEY, "valkey_secure", spec);
+
+    proto::admin::StorageConfig admin_config;
+    ProtoConvert::StorageConfigToProto(original, &admin_config);
+    ASSERT_TRUE(admin_config.has_valkey());
+    EXPECT_EQ(spec->endpoint(), admin_config.valkey().endpoint());
+    EXPECT_EQ(spec->security_dir(), admin_config.valkey().security_dir());
+    EXPECT_EQ(std::string::npos, admin_config.SerializeAsString().find("username"));
+    EXPECT_EQ(std::string::npos, admin_config.SerializeAsString().find("password"));
+
+    StorageConfig restored;
+    ProtoConvert::StorageFromProto(&admin_config, restored);
+    const auto restored_spec = std::dynamic_pointer_cast<ValkeyStorageSpec>(restored.storage_spec());
+    ASSERT_NE(nullptr, restored_spec);
+    EXPECT_EQ(spec->endpoint(), restored_spec->endpoint());
+    EXPECT_EQ(spec->security_dir(), restored_spec->security_dir());
+    std::string invalid_fields;
+    EXPECT_TRUE(restored.ValidateRequiredFields(invalid_fields)) << invalid_fields;
+
+    proto::meta::StorageConfig meta_config;
+    meta_config.set_global_unique_name("valkey_secure");
+    meta_config.mutable_valkey()->set_endpoint(spec->endpoint());
+    meta_config.mutable_valkey()->set_security_dir(spec->security_dir());
+    proto::meta::StorageConfig meta_restored;
+    ASSERT_TRUE(meta_restored.ParseFromString(meta_config.SerializeAsString()));
+    EXPECT_EQ(spec->endpoint(), meta_restored.valkey().endpoint());
+    EXPECT_EQ(spec->security_dir(), meta_restored.valkey().security_dir());
+    EXPECT_EQ(std::string::npos, meta_restored.SerializeAsString().find("username"));
+    EXPECT_EQ(std::string::npos, meta_restored.SerializeAsString().find("password"));
+}
+
+} // namespace kv_cache_manager

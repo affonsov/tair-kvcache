@@ -42,7 +42,7 @@ ClientErrorCode SdkWrapper::Init(const std::unique_ptr<ClientConfig> &client_con
     }
     const std::string &storage_configs = init_params.storage_configs;
     if (!Jsonizable::FromJsonString(storage_configs, storage_configs_)) {
-        KVCM_LOG_WARN("parse storage config failed, storage config: %s", storage_configs.c_str());
+        KVCM_LOG_WARN("parse storage config failed, storage_config_bytes: %zu", storage_configs.size());
         return ER_INVALID_STORAGE_CONFIG;
     }
     if (storage_configs_.empty()) {

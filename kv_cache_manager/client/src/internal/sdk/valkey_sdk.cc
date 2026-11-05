@@ -67,10 +67,16 @@ ClientErrorCode ValkeySdk::Init(const std::shared_ptr<SdkBackendConfig> &sdk_bac
     StandardUri put_endpoint = get_endpoint;
     get_endpoint.SetParam("timeout_ms", std::to_string(sdk_backend_config->timeout_config().get_timeout_ms()));
     put_endpoint.SetParam("timeout_ms", std::to_string(sdk_backend_config->timeout_config().put_timeout_ms()));
+    RedisSecurityOptions security_options;
+    if (storage_spec->secure()) {
+        security_options.transport = RedisTransportSecurity::TLS_NAMED_ACL;
+        security_options.directory = storage_spec->security_dir();
+    }
 
-    auto make_pool = [this](const StandardUri &endpoint) {
-        return std::make_unique<RedisClientPool>([this, endpoint]() {
-            auto client = CreateClient(endpoint);
+    auto make_pool = [this, security_options](const StandardUri &endpoint) {
+        RedisConnectionOptions connection_options{endpoint, security_options};
+        return std::make_unique<RedisClientPool>([this, connection_options]() {
+            auto client = CreateClient(connection_options);
             if (!client || !client->Open()) {
                 return std::shared_ptr<RedisClient>();
             }
@@ -291,8 +297,8 @@ ClientErrorCode ValkeySdk::Alloc(const std::vector<DataStorageUri> &remote_uris,
     return ER_OK;
 }
 
-std::shared_ptr<RedisClient> ValkeySdk::CreateClient(const StandardUri &endpoint) {
-    return std::make_shared<RedisClient>(endpoint);
+std::shared_ptr<RedisClient> ValkeySdk::CreateClient(const RedisConnectionOptions &options) {
+    return std::make_shared<RedisClient>(options);
 }
 
 std::vector<ErrorCode> ValkeySdk::SetStrings(RedisClient &client,

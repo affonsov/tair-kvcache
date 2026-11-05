@@ -51,10 +51,10 @@ cc_test(
         "crash_handler_test.cc",
     ],
     copts = ["-fno-access-control"],
+    data = [],
     linkopts = [
         "-rdynamic",
     ],
-    data = [],
     deps = [
         "//kv_cache_manager/common:crash_handler",
         "//kv_cache_manager/common:unittest",
@@ -154,6 +154,33 @@ cc_library(
     ],
 )
 
+cc_library(
+    name = "secure_valkey_test_environment",
+    testonly = True,
+    srcs = ["secure_valkey_test_environment.cc"],
+    hdrs = ["secure_valkey_test_environment.h"],
+    visibility = [
+        "//kv_cache_manager/client/src/internal/sdk/test:__pkg__",
+        "//kv_cache_manager/client/test:__pkg__",
+        "//kv_cache_manager/data_storage/test:__pkg__",
+    ],
+    deps = ["@boringssl//:crypto"],
+)
+
+cc_test(
+    name = "redis_client_secure_real_service_test",
+    srcs = ["redis_client_secure_real_service_test.cc"],
+    tags = [
+        "manual",
+        "valkey",
+    ],
+    deps = [
+        ":secure_valkey_test_environment",
+        "//kv_cache_manager/common:redis_client",
+        "//kv_cache_manager/common:unittest",
+    ],
+)
+
 cc_test(
     name = "redis_client_test",
     srcs = [
@@ -232,9 +259,9 @@ cc_test(
     deps = [
         "//kv_cache_manager/common:service_discovery",
         "//kv_cache_manager/common:service_discovery_factory",
-        "//stub_source/kv_cache_manager/common:spectrum_service_discovery",
         "//kv_cache_manager/common:static_service_discovery",
         "//kv_cache_manager/common:unittest",
+        "//stub_source/kv_cache_manager/common:spectrum_service_discovery",
     ],
 )
 
