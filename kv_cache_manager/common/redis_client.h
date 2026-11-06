@@ -1,5 +1,8 @@
 #pragma once
 
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
 #include <hiredis.h>
 #include <map>
 #include <memory>
@@ -11,6 +14,27 @@
 
 namespace kv_cache_manager {
 
+enum class ValkeyWriteCertainty : uint8_t {
+    NOT_SENT,
+    CONFIRMED,
+    AMBIGUOUS,
+};
+
+struct ValkeySetStringsResult {
+    ErrorCode operation_error = EC_OK;
+    std::vector<ErrorCode> errors;
+    std::vector<ValkeyWriteCertainty> certainties;
+    std::size_t confirmed_count = 0;
+    std::size_t ambiguous_count = 0;
+    std::size_t not_sent_count = 0;
+};
+
+struct ValkeyGetStringsResult {
+    ErrorCode operation_error = EC_OK;
+    std::vector<ErrorCode> errors;
+    std::vector<std::string> values;
+};
+
 class RedisClient {
 public:
     RedisClient(const StandardUri &storage_uri);
@@ -18,11 +42,29 @@ public:
 
     RedisClient(const RedisClient &) = delete;
     RedisClient &operator=(const RedisClient &) = delete;
-    RedisClient(RedisClient &&) = default;
-    RedisClient &operator=(RedisClient &&) = default;
+    RedisClient(RedisClient &&) = delete;
+    RedisClient &operator=(RedisClient &&) = delete;
+
+    using Deadline = std::chrono::steady_clock::time_point;
 
     bool Open();
     void Close();
+
+    // Resolves and caches numeric IPv4/IPv6 addresses for deadline operations.
+    // The original hostname remains available for later identity verification.
+    // DNS refresh requires constructing and preparing a new SDK/client instance.
+    bool Prepare();
+    ValkeySetStringsResult
+    SetStringsUntil(const std::vector<std::string> &keys, const std::vector<std::string> &values, Deadline deadline);
+    // Uses one EVAL_RO per key to atomically distinguish missing from empty and
+    // fetch at most expected_size + 1 bytes from a compliant Valkey server.
+    // Trust boundary: stock hiredis cannot defend against a malicious
+    // authenticated server that lies in a RESP bulk length. No parser patch is
+    // applied here.
+    ValkeyGetStringsResult GetStringsUntil(const std::vector<std::string> &keys,
+                                           const std::vector<std::size_t> &expected_sizes,
+                                           Deadline deadline);
+
     std::vector<ErrorCode> SetStrings(const std::vector<std::string> &keys, const std::vector<std::string> &values);
     std::vector<ErrorCode> GetStrings(const std::vector<std::string> &keys, std::vector<std::string> &out_values);
     std::vector<ErrorCode> Set(const std::vector<std::string> &keys,
@@ -101,11 +143,30 @@ protected:
     virtual bool IsContextOk() const;
     virtual bool Reconnect();
     virtual std::vector<ReplyUPtr> TryExecPipeline(const std::vector<CmdArgs> &cmds);
+    virtual bool AppendDeadlineCommand(const CmdArgs &cmd);
+    // Takes ownership of socket_fd exactly when a non-null context is returned.
+    virtual redisContext *AdoptConnectedSocket(int socket_fd);
 
 private:
+    class DeadlineWatchdog;
+
+    struct NumericAddress {
+        int family = 0;
+        std::string address;
+    };
+
+    bool ConnectUntil(Deadline deadline, DeadlineWatchdog &watchdog);
+    bool ReconnectUntil(Deadline deadline, DeadlineWatchdog &watchdog);
+    bool
+    ConnectNumericAddressUntil(const NumericAddress &numeric_address, Deadline deadline, DeadlineWatchdog &watchdog);
+    bool ApplyRemainingSocketTimeout(Deadline deadline);
+    void RestoreConfiguredSocketTimeoutOrDisconnect();
+
     redisContext *context_ = nullptr;
     std::string user_info_;
     std::string host_;
+    std::vector<NumericAddress> numeric_addresses_;
+    bool prepared_ = false;
     int64_t port_ = 0;
     int64_t db_ = 0;
     int64_t timeout_ms_ = 2000;
