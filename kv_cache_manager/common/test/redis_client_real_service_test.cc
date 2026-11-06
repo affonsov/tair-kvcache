@@ -1,4 +1,6 @@
+#include <chrono>
 #include <cstddef>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -185,6 +187,87 @@ TEST_F(RedisClientRealServiceTest, TestMultiChunkBinaryStrings) {
     redis_client_->Close();
 }
 
+TEST_F(RedisClientRealServiceTest, TestDeadlineBoundedBinaryStrings) {
+    ASSERT_TRUE(redis_client_->Prepare());
+    const std::string binary_key("redis_deadline_key\0\xff", 20);
+    const std::string empty_key = "redis_deadline_empty";
+    const std::string missing_key = "redis_deadline_missing";
+    const std::string binary_value("value\0\x80\xff", 8);
+    const std::vector<std::string> cleanup_keys{binary_key, empty_key, missing_key};
+    (void)redis_client_->Delete(cleanup_keys);
+
+    const auto set_result = redis_client_->SetStringsUntil(
+        {binary_key, empty_key}, {binary_value, ""}, std::chrono::steady_clock::now() + std::chrono::seconds(3));
+    EXPECT_EQ(EC_OK, set_result.operation_error);
+    EXPECT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}), set_result.errors);
+    EXPECT_EQ(2u, set_result.confirmed_count);
+    EXPECT_EQ(0u, set_result.ambiguous_count);
+    EXPECT_EQ(0u, set_result.not_sent_count);
+
+    const auto get_result = redis_client_->GetStringsUntil({binary_key, empty_key, missing_key},
+                                                           {binary_value.size(), 0, 0},
+                                                           std::chrono::steady_clock::now() + std::chrono::seconds(3));
+    EXPECT_EQ(EC_OK, get_result.operation_error);
+    EXPECT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK, EC_NOENT}), get_result.errors);
+    EXPECT_EQ(binary_value, get_result.values[0]);
+    EXPECT_EQ("", get_result.values[1]);
+
+    const auto short_result =
+        redis_client_->GetStringsUntil({binary_key, binary_key},
+                                       {binary_value.size() + 1, binary_value.size() - 1},
+                                       std::chrono::steady_clock::now() + std::chrono::seconds(3));
+    EXPECT_EQ((std::vector<ErrorCode>{EC_MISMATCH, EC_MISMATCH}), short_result.errors);
+    EXPECT_EQ(std::vector<std::string>(2), short_result.values);
+
+    EXPECT_EQ(std::vector<ErrorCode>(2, EC_OK), redis_client_->Delete({binary_key, empty_key}));
+}
+
+TEST_F(RedisClientRealServiceTest, TestDeadlineMultiChunkStrings) {
+    ASSERT_TRUE(redis_client_->Prepare());
+    std::vector<std::string> keys;
+    std::vector<std::string> values;
+    std::vector<std::size_t> expected_sizes;
+    for (std::size_t i = 0; i < 65; ++i) {
+        keys.push_back("redis_deadline_chunk_" + std::to_string(i));
+        values.push_back("value-" + std::to_string(i));
+        expected_sizes.push_back(values.back().size());
+    }
+    (void)redis_client_->Delete(keys);
+    const auto set_result =
+        redis_client_->SetStringsUntil(keys, values, std::chrono::steady_clock::now() + std::chrono::seconds(3));
+    EXPECT_EQ(65u, set_result.confirmed_count);
+    const auto get_result = redis_client_->GetStringsUntil(
+        keys, expected_sizes, std::chrono::steady_clock::now() + std::chrono::seconds(3));
+    EXPECT_EQ(std::vector<ErrorCode>(65, EC_OK), get_result.errors);
+    EXPECT_EQ(values, get_result.values);
+    EXPECT_EQ(std::vector<ErrorCode>(65, EC_OK), redis_client_->Delete(keys));
+}
+
+TEST_F(RedisClientRealServiceTest, TestDeadlineSelectDb) {
+    auto make_client = [](int64_t db) {
+        return std::make_unique<RedisClient>(
+            StandardUri::FromUri(redis_test::Uri("test_user:test_password", db, "timeout_ms=2000&retry_count=2")));
+    };
+    auto client_db0 = make_client(redis_test::kRedisClientDb);
+    auto client_db1 = make_client(redis_test::kRedisClientAlternateDb);
+    ASSERT_TRUE(client_db0->Prepare());
+    ASSERT_TRUE(client_db1->Prepare());
+    const std::string key = "redis_deadline_select_db";
+    (void)client_db0->Delete({key});
+    (void)client_db1->Delete({key});
+
+    const auto set_result =
+        client_db1->SetStringsUntil({key}, {"value"}, std::chrono::steady_clock::now() + std::chrono::seconds(3));
+    EXPECT_EQ(1u, set_result.confirmed_count);
+    const auto db1_result =
+        client_db1->GetStringsUntil({key}, {5}, std::chrono::steady_clock::now() + std::chrono::seconds(3));
+    EXPECT_EQ((std::vector<ErrorCode>{EC_OK}), db1_result.errors);
+    const auto db0_result =
+        client_db0->GetStringsUntil({key}, {5}, std::chrono::steady_clock::now() + std::chrono::seconds(3));
+    EXPECT_EQ((std::vector<ErrorCode>{EC_NOENT}), db0_result.errors);
+    EXPECT_EQ((std::vector<ErrorCode>{EC_OK}), client_db1->Delete({key}));
+}
+
 TEST_F(RedisClientRealServiceTest, TestNotExistKey) {
     ASSERT_TRUE(redis_client_->Open());
 
@@ -214,7 +297,8 @@ TEST_F(RedisClientRealServiceTest, TestNotExistKey) {
     expected_field_maps.emplace_back(std::map<std::string, std::string>{}); // key4 not exist
     std::vector<ErrorCode> expected_ec_per_key = {EC_OK, EC_OK, EC_NOENT, EC_NOENT};
     std::vector<std::map<std::string, std::string>> out_field_maps;
-    ec_per_key = redis_client_->Get(all_keys, /*field_names*/ std::vector<std::string>{"f1", "f2", "f3"}, out_field_maps);
+    ec_per_key =
+        redis_client_->Get(all_keys, /*field_names*/ std::vector<std::string>{"f1", "f2", "f3"}, out_field_maps);
     ASSERT_EQ(expected_ec_per_key, ec_per_key);
     ASSERT_EQ(expected_field_maps, out_field_maps);
 
