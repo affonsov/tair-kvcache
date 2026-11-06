@@ -1,25 +1,49 @@
-# Client SDK I/O 契约（静态超时预算 / 内部取消 / Buffer 生命周期）
+# Client SDK I/O Contract (Call Context / Hard Deadline / Buffer Lifetime)
 
 ## 1. 核心契约（一句话）
 
-**调用接口不携带任何时间参数；SdkWrapper 在 Init 阶段把自身配置的静态超时预算
-（`sdk_config.timeout_config` 的 get/put_timeout_ms）注入每个后端的
-`SdkBackendConfig::timeout_config()`，后端从自身任务起点起算 deadline，
-预算内完成或内部取消 —— 到点后不得再触碰调用方的 local buffers。**
+**`SdkWrapper` creates one root `SdkCallContext` at Get/Put entry. Every
+accepted group receives a child context. All children share the same absolute
+`std::chrono::steady_clock` deadline, cancellation flag, and caller-memory
+access gate, while each child owns distinct output-commit admission,
+completion, and result state.**
 
-各后端按自身能力履约（见 §3 矩阵）。做不到"绝不碰"的后端必须如实声明为 soft 级。
+`GetWithContext` and `PutWithContext` belong to the separate optional
+`ContextualSdkInterface`. `SdkWrapper` discovers that interface with
+`dynamic_cast`; the existing `SdkInterface` virtual method order is unchanged.
+Legacy backends continue through the original `Get` and `Put` methods and use
+the statically injected timeout configuration.
+
+`SdkWrapper::Init` constructs its wrapper configuration, parsed storage
+configuration, running wait-task pool, SDK map, and optional owned shared-memory
+file descriptor as pending state. It publishes those existing members only
+after every SDK is created. Get and Put infer successful initialization from
+the published pool and reject calls before publication. A function-static
+lifecycle read/write lock permits concurrent Get and Put calls while serializing
+Init and destruction across wrapper instances; an Init after successful
+initialization is rejected.
+
+Context-aware implementations distinguish source-read access from output-commit
+access. Both acquire an RAII guard before dereferencing caller memory. Only an
+output-commit admission is a result linearization point, but it is not a
+completed result. The guard must call `Complete(ClientErrorCode)` after all
+caller-visible writes and before release. A guard released without completion
+does not publish a result. Cancellation is published first and then waits for
+active guards, so no guarded caller-memory access continues after the wrapper
+returns. Expired or cancelled guard acquisition fails closed. Once an output
+commit is admitted before its deadline, it finishes under that guard without a
+later per-IOV deadline check.
 
 ## 2. 机制分层
 
 | 层 | 职责 |
 |---|---|
-| SdkWrapper | 等待上限 = 入口 + 静态预算；任务从线程池被拾起时做**准入检查**（已过预算的任务拒绝发起 I/O）；Init 时注入预算给后端 |
-| 存储后端 | 从**自身任务起点**起算 deadline（= 起点 + 注入预算）；组级/逐 block/逐 key 准入；超时时执行内部取消 |
+| SdkWrapper | Create the root absolute deadline at wrapper entry; create one child context per accepted group; submit with nonblocking `TryAsync`; preserve bounded drain and static timeout injection for legacy SDKs; publish stop and shared cancellation before draining accepted futures; synchronize guarded caller-memory access before every return |
+| Context-aware storage backend | Consume the unchanged shared absolute deadline for admission and I/O; guard every caller-memory gather, scatter, and output publication; complete each output guard with the published result |
+| Legacy storage backend | Use the original ABI and statically injected timeout budget; legacy calls publish no contextual output-commit result and retain their documented hard/soft buffer-lifetime behavior |
 
-两个起算点的关系：后端起点晚于 wrapper 入口，差值为 wrapper 线程池的排队等待 W_q。
-**排序不变量**：`W_q + 后端内部耗时 ≤ wrapper 预算`。同步调用方（排队为零）
-自然满足；异步调用方依赖排队有界（池线程数配置）。后端内部超时取值应给 W_q
-留出余量 —— PACE 的实践是内部 10s 对 wrapper 15s（5s 余量）。
+Queue time is part of the context deadline. A backend must not derive a fresh
+relative timeout when its worker starts.
 
 ## 3. 后端履约矩阵
 
@@ -28,7 +52,7 @@
 | LocalFile / NFS | 逐 block | 组级 + 逐 block | hard | abort 路径 sync GPU stream（GpuStreamDrainGuard），真取消 |
 | HF3FS | hf3fs_wait_for_ios(abs_timeout) | 逐 block | hard | 数据先落自有 shm iov；超时不执行 CopyIovs；泄漏 iov/IOR 而不 free（free = UAF） |
 | Mooncake | 逐 key 前置检查 | 逐 key | soft | 上游无取消语义；超时路径输出可归因日志（key/buffer/elapsed） |
-| Valkey | Static admission and client-pool deadlines | Batch granularity | soft | Inherited blocking Redis command I/O cannot currently be cancelled or further bounded by the SDK deadline; a late Get does not write to caller buffers; a late Put publishes actual URIs and returns success only when every SET reports `EC_OK` |
+| Valkey | Wrapper-entry absolute deadline for pool and socket I/O | Batch admission plus per-command PR2 checks | hard | Pool clients are prepared during SDK initialization so operation-time reconnects use cached numeric addresses. Contextual calls use `AcquireClientUntil`, `SetStringsUntil`, and bounded `EVAL_RO` `GetStringsUntil` with the unchanged deadline. Put allocates owned destination strings before source admission, copies caller IOVs in 64 KiB chunks with a live check between chunks, and completes output guards after scatter/publication. |
 | TairMempool (PACE) | PACE 内部超时（10s） | PACE 自管理 | hard（staging + cancel_and_drain） | **不读取注入的预算**（自行管理内部超时）；要求内部超时 < wrapper 预算（10s < 15s） |
 
 注：PACE 属跨仓库生产路径，本仓库不修改其实现；注入字段对它是纯增量（不读即无行为
@@ -36,17 +60,25 @@
 
 ## 4. Known Limitations
 
-1. **W_q 残留窗口**：后端 deadline 锚定自身起点，排队等待 W_q 使后端可能晚于
-   wrapper 预算完成（同步调用方无此问题；生产 v6d 路径为同步直调）。后端内部
-   取消机制保证其自身 deadline 之后不再触碰 caller buffer。
+1. **Queue time is charged to contextual calls**: `SdkWrapper` creates the
+   deadline before validation, grouping, and queueing. Valkey consumes that same
+   absolute deadline. Legacy backends still use their injected relative budget,
+   so their existing queue-time limitation remains unchanged.
 2. **ManagerClient / RTPLLMClient 层**：走 TransferClient 的既有路径，自动获得
    wrapper 预算，无额外配置。
-3. **超时路径不等在飞任务；普通错误路径有界等待**：RunWithTimeoutParallel 在
-   预算到期时立即返回；在飞任务的 I/O 不被取消（hard 后端的逐块准入会尽快
-   停下；soft 后端见 §3）。普通错误路径则不同：错误往往发生在预算之前，SDK 仍在
-   契约允许的窗口内写 caller buffer，因此错误路径会先置 stop 拦截仍在排队的
-   group（不再发起新 I/O），再有界等待在飞 peer 至多到预算才返回 —— 否则
-   caller 拿到错误后立即复用/释放 buffer，与在飞 DMA 构成数据竞争。
+3. **Timeout, error, and submission draining**: `RunWithTimeoutParallel` uses
+   nonblocking `TryAsync`; queue-full and stopped-pool rejections never execute a
+   task inline. After any task was accepted, timeout, error, rejection, or
+   submission failure publishes stop and shared cancellation before bounded
+   draining. One precedence helper then scans every accepted future outcome and
+   every child context's completed commit result. A reported timeout, or a result
+   that remains unknown at the deadline, takes precedence over thread-pool and
+   ordinary SDK errors. `ER_TASK_CANCELLED` is internal and is never returned.
+   A Get result is preserved across deadline cancellation only when every
+   accepted group has admitted and completed its own output commit with a known
+   result. A completed child commit remains readable after caller-memory guards
+   drain even if the task callable has not yet fulfilled its future. One group's
+   commit never validates a legacy or incomplete peer.
 4. **HF3FS 超时泄漏 iov/IOR**：当 DeadlineExpired 导致 WaitIos 超时时，不释放已
    提交的 I/O 的 iov 缓冲区和 IOR（释放会导致 UAF）。泄漏规模 = 一次超时的读写
    调用涉及的 iov 大小。线上应在 WARN 日志中观测泄漏频率，若高频则需引入 3FS
@@ -54,12 +86,17 @@
 5. **Mooncake 为 soft 级**：超时后在飞的 DMA 无法取消；调用方在收到超时后立即
    复用相应 buffer 是文档化的数据竞争。逐 key 准入把暴露面从整批降到 ≤1 个在飞
    key。
-6. **Valkey uses a soft timeout**: Static budgets bound admission and
-   client-pool waits. Inherited blocking Redis command I/O cannot currently be
-   cancelled or further bounded by the SDK deadline. Get checks the deadline
-   again after the command returns; a late Get returns `ER_SDK_TIMEOUT` and does
-   not scatter to caller buffers. Put first validates the result count and each
-   key's result. A late Put publishes `actual_remote_uris` and returns `ER_OK`
-   only when every SET reports `EC_OK`; otherwise, the timed-out operation
-   returns `ER_SDK_TIMEOUT`. Hard Redis socket/I/O deadlines and retry
-   cancellation are outside the current scope.
+6. **Valkey hard-deadline and result precedence**: Expired/cancelled work is
+   rejected before pool acquisition or Redis I/O. Operation-level or per-item
+   `EC_TIMEOUT` returns `ER_SDK_TIMEOUT`. Any
+   `ValkeyWriteCertainty::AMBIGUOUS` also returns `ER_SDK_TIMEOUT`, because write
+   completion is unknown. Otherwise, malformed cardinality, operation errors,
+   per-item errors, or `NOT_SENT` items return `ER_SDKWRITE_ERROR`. Put publishes
+   `actual_remote_uris` only when the operation succeeds, every item is `EC_OK`
+   and `CONFIRMED`, and an output commit is admitted before cancellation or the
+   deadline. Get performs no scatter for an operation/per-item timeout or
+   malformed operation result; for a successful operation, valid peers may still
+   be scattered when other peers have only non-timeout errors. An admitted Get
+   scatter or Put publication finishes under its output guard even if the clock
+   crosses the deadline during that commit. `GetStringsUntil` uses bounded
+   `EVAL_RO` reads capped at each expected size plus one byte.

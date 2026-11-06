@@ -15,6 +15,7 @@ class StorageConfig;
 class LockFreeThreadPool;
 class SdkFactory;
 class SdkInterface;
+class SdkCallContext;
 
 class SdkWrapper {
 public:
@@ -55,13 +56,17 @@ private:
 
     std::string getOpTypeString(OpType op_type) const;
     ClientErrorCode RunWithTimeoutParallel(OpType op_type,
-                                           std::vector<std::function<ClientErrorCode()>> &&tasks,
-                                           int timeout_ms) const;
+                                           std::vector<std::function<ClientErrorCode(const SdkCallContext &)>> &&tasks,
+                                           const SdkCallContext &context) const;
     ClientErrorCode UpdateMooncakeSdkConfig(const std::shared_ptr<SdkBackendConfig> &sdk_backend_config,
                                             RegistSpan *span,
                                             const std::string &self_location_spec_name);
     ClientErrorCode PrepareSharedMemoryRegistration(const SharedMemoryRegistration &shared_memory_registration,
                                                     SharedMemoryRegistration &prepared_registration);
+    static ClientErrorCode
+    PrepareSharedMemoryRegistrationCandidate(const SharedMemoryRegistration &shared_memory_registration,
+                                             SharedMemoryRegistration &prepared_registration,
+                                             int &owned_fd_candidate);
     ClientErrorCode UpdateTairMempoolSdkConfig(const std::shared_ptr<SdkBackendConfig> &sdk_backend_config,
                                                const ClientMemoryRegistrations *memory_registrations);
 

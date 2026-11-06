@@ -1,5 +1,8 @@
+#include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <functional>
+#include <future>
 #include <limits>
 #include <memory>
 #include <new>
@@ -39,17 +42,26 @@ void ThrowIfConfigured(ClientThrowMode mode) {
 struct FakeRedisState {
     std::size_t set_calls = 0;
     std::size_t get_calls = 0;
+    std::size_t prepare_calls = 0;
     bool use_set_results = false;
+    bool use_set_certainties = false;
     bool use_get_results = false;
     int set_delay_ms = 0;
     int get_delay_ms = 0;
     ClientThrowMode set_throw_mode = ClientThrowMode::NONE;
     ClientThrowMode get_throw_mode = ClientThrowMode::NONE;
+    ErrorCode set_operation_error = EC_OK;
+    ErrorCode get_operation_error = EC_OK;
     std::vector<ErrorCode> set_results;
+    std::vector<ValkeyWriteCertainty> set_certainties;
     std::vector<ErrorCode> get_results;
     std::vector<std::string> get_values;
     std::vector<std::string> last_keys;
     std::vector<std::string> last_values;
+    std::chrono::steady_clock::time_point acquire_get_deadline;
+    std::chrono::steady_clock::time_point acquire_put_deadline;
+    std::chrono::steady_clock::time_point get_io_deadline;
+    std::chrono::steady_clock::time_point set_io_deadline;
 };
 
 class FakeRedisClient : public RedisClient {
@@ -66,6 +78,10 @@ public:
     explicit TestValkeySdk(std::shared_ptr<FakeRedisState> state) : state_(std::move(state)) {}
 
     void set_fail_client_creation(bool value) { fail_client_creation_ = value; }
+    void set_source_chunk_hook(std::function<void(std::size_t, std::size_t, std::size_t)> hook) {
+        source_chunk_hook_ = std::move(hook);
+    }
+    void set_output_commit_hook(std::function<void()> hook) { output_commit_hook_ = std::move(hook); }
     const std::vector<std::string> &created_endpoints() const { return created_endpoints_; }
 
 protected:
@@ -77,34 +93,86 @@ protected:
         return std::make_shared<FakeRedisClient>(endpoint);
     }
 
-    std::vector<ErrorCode>
-    SetStrings(RedisClient &, const std::vector<std::string> &keys, const std::vector<std::string> &values) override {
+    bool PrepareClient(RedisClient &) override {
+        ++state_->prepare_calls;
+        return true;
+    }
+
+    RedisClientHandle AcquireGetClientUntil(Deadline deadline) override {
+        state_->acquire_get_deadline = deadline;
+        return ValkeySdk::AcquireGetClientUntil(deadline);
+    }
+
+    RedisClientHandle AcquirePutClientUntil(Deadline deadline) override {
+        state_->acquire_put_deadline = deadline;
+        return ValkeySdk::AcquirePutClientUntil(deadline);
+    }
+
+    ValkeySetStringsResult SetStringsUntil(RedisClient &,
+                                           const std::vector<std::string> &keys,
+                                           const std::vector<std::string> &values,
+                                           Deadline deadline) override {
         ++state_->set_calls;
+        state_->set_io_deadline = deadline;
         if (state_->set_delay_ms > 0) {
             std::this_thread::sleep_for(std::chrono::milliseconds(state_->set_delay_ms));
         }
         ThrowIfConfigured(state_->set_throw_mode);
         state_->last_keys = keys;
         state_->last_values = values;
-        return state_->use_set_results ? state_->set_results : std::vector<ErrorCode>(keys.size(), EC_OK);
+
+        ValkeySetStringsResult result;
+        result.operation_error = state_->set_operation_error;
+        result.errors = state_->use_set_results ? state_->set_results : std::vector<ErrorCode>(keys.size(), EC_OK);
+        if (state_->use_set_certainties) {
+            result.certainties = state_->set_certainties;
+        } else {
+            result.certainties.reserve(result.errors.size());
+            for (const ErrorCode error : result.errors) {
+                result.certainties.push_back(error == EC_OK ? ValkeyWriteCertainty::CONFIRMED
+                                                            : ValkeyWriteCertainty::NOT_SENT);
+            }
+        }
+        return result;
     }
 
-    std::vector<ErrorCode>
-    GetStrings(RedisClient &, const std::vector<std::string> &keys, std::vector<std::string> &values) override {
+    ValkeyGetStringsResult GetStringsUntil(RedisClient &,
+                                           const std::vector<std::string> &keys,
+                                           const std::vector<std::size_t> &,
+                                           Deadline deadline) override {
         ++state_->get_calls;
+        state_->get_io_deadline = deadline;
         if (state_->get_delay_ms > 0) {
             std::this_thread::sleep_for(std::chrono::milliseconds(state_->get_delay_ms));
         }
         ThrowIfConfigured(state_->get_throw_mode);
         state_->last_keys = keys;
-        values = state_->get_values;
-        return state_->use_get_results ? state_->get_results : std::vector<ErrorCode>(keys.size(), EC_OK);
+
+        ValkeyGetStringsResult result;
+        result.operation_error = state_->get_operation_error;
+        result.errors = state_->use_get_results ? state_->get_results : std::vector<ErrorCode>(keys.size(), EC_OK);
+        result.values = state_->get_values;
+        return result;
+    }
+
+    void OnSourceChunkRead(std::size_t block_index, std::size_t iov_index, std::size_t chunk_size) override {
+        if (source_chunk_hook_) {
+            source_chunk_hook_(block_index, iov_index, chunk_size);
+        }
+    }
+
+    void OnOutputCommitAdmitted() override {
+        if (output_commit_hook_) {
+            output_commit_hook_();
+        }
     }
 
 private:
     std::shared_ptr<FakeRedisState> state_;
     bool fail_client_creation_ = false;
     std::vector<std::string> created_endpoints_;
+    std::function<void(std::size_t, std::size_t, std::size_t)> source_chunk_hook_;
+    std::function<void()> output_commit_hook_;
 };
 
 std::shared_ptr<SdkBackendConfig> MakeSdkConfig(int get_timeout_ms = 2000, int put_timeout_ms = 2000) {
@@ -181,6 +249,7 @@ TEST(ValkeySdkInitTest, ValidatesConfigsInitializesSeparateTimedPoolsAndReportsT
 
     TestValkeySdk valid(state);
     ASSERT_EQ(ER_OK, valid.Init(MakeSdkConfig(13, 17), MakeStorageConfig()));
+    EXPECT_EQ(8u, state->prepare_calls);
     ASSERT_EQ(8u, valid.created_endpoints().size());
     for (std::size_t i = 0; i < 4; ++i) {
         EXPECT_EQ("valkey://cache.internal:6379/?db=11&timeout_ms=13", valid.created_endpoints()[i]);
@@ -193,6 +262,7 @@ TEST(ValkeySdkInitTest, ValidatesConfigsInitializesSeparateTimedPoolsAndReportsT
     ASSERT_EQ(ER_OK,
               redis_alias.Init(MakeSdkConfig(13, 17),
                                MakeStorageConfig("valkey-primary", "redis://cache.internal:6379/?db=11")));
+    EXPECT_EQ(16u, state->prepare_calls);
     ASSERT_EQ(8u, redis_alias.created_endpoints().size());
     for (std::size_t i = 0; i < 4; ++i) {
         EXPECT_EQ("redis://cache.internal:6379/?db=11&timeout_ms=13", redis_alias.created_endpoints()[i]);
@@ -416,7 +486,7 @@ TEST_F(ValkeySdkTest, GetPopulatesValidPeersButPreservesFailedAndWrongSizedBlock
     EXPECT_EQ(std::string("k\xff", 2), std::string(valid_second, sizeof(valid_second)));
 }
 
-TEST_F(ValkeySdkTest, GetDefendsCardinalityAndPropagatesTimeoutAfterValidPeers) {
+TEST_F(ValkeySdkTest, GetDefendsCardinalityAndTimeoutNeverScatters) {
     char first[2] = {'x', 'x'};
     char second[2] = {'y', 'y'};
     const std::vector<DataStorageUri> uris{
@@ -442,7 +512,7 @@ TEST_F(ValkeySdkTest, GetDefendsCardinalityAndPropagatesTimeoutAfterValidPeers) 
     state_->get_values = {"ignored", "ok"};
     EXPECT_EQ(ER_SDK_TIMEOUT, sdk_->Get(uris, buffers));
     EXPECT_EQ("xx", std::string(first, 2));
-    EXPECT_EQ("ok", std::string(second, 2));
+    EXPECT_EQ("yy", std::string(second, 2));
     EXPECT_EQ(3u, state_->get_calls);
 }
 
@@ -474,7 +544,7 @@ TEST_F(ValkeySdkTest, ClientExceptionsMapToCurrentErrorsWithoutPublishingOutputs
     EXPECT_EQ(1u, state_->set_calls);
 }
 
-TEST_F(ValkeySdkTest, SoftTimeoutKeepsLateGetIsolatedAndPublishesConfirmedLatePut) {
+TEST_F(ValkeySdkTest, HardDeadlineRejectsLatePutAndGetPublication) {
     constexpr int kShortTimeoutMs = 20;
     constexpr int kFakeDelayMs = 100;
     auto timeout_state = std::make_shared<FakeRedisState>();
@@ -488,9 +558,9 @@ TEST_F(ValkeySdkTest, SoftTimeoutKeepsLateGetIsolatedAndPublishesConfirmedLatePu
     auto actual = std::make_shared<std::vector<DataStorageUri>>(1, sentinel);
 
     timeout_state->set_delay_ms = kFakeDelayMs;
-    EXPECT_EQ(ER_OK, timeout_sdk.Put(uris, {CpuBuffer(&source, 1)}, actual));
+    EXPECT_EQ(ER_SDK_TIMEOUT, timeout_sdk.Put(uris, {CpuBuffer(&source, 1)}, actual));
     ASSERT_EQ(1u, actual->size());
-    EXPECT_EQ(uris[0].ToUriString(), actual->at(0).ToUriString());
+    EXPECT_EQ(sentinel.ToUriString(), actual->at(0).ToUriString());
 
     *actual = {sentinel};
     timeout_state->use_set_results = true;
@@ -554,6 +624,242 @@ TEST_F(ValkeySdkTest, PoolExhaustionFailsWithoutBatchIo) {
     EXPECT_EQ(ER_SDK_TIMEOUT, timeout_sdk.Get(uris, buffers));
     EXPECT_EQ(0u, timeout_state->set_calls);
     EXPECT_EQ(0u, timeout_state->get_calls);
+}
+
+TEST_F(ValkeySdkTest, ContextDeadlineIsPassedUnchangedToPoolAndRedisIo) {
+    char source = 'v';
+    char destination = 'x';
+    const std::vector<DataStorageUri> uris{MakeLocation("valkey-primary", "00000000000000000000000000000012", 1)};
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    const SdkCallContext put_context(deadline);
+    const SdkCallContext get_context(deadline);
+    auto actual = std::make_shared<std::vector<DataStorageUri>>();
+
+    ASSERT_EQ(ER_OK, sdk_->PutWithContext(uris, {CpuBuffer(&source, 1)}, actual, put_context));
+    EXPECT_EQ(deadline, state_->acquire_put_deadline);
+    EXPECT_EQ(deadline, state_->set_io_deadline);
+
+    state_->get_values = {"z"};
+    ASSERT_EQ(ER_OK, sdk_->GetWithContext(uris, {CpuBuffer(&destination, 1)}, get_context));
+    EXPECT_EQ(deadline, state_->acquire_get_deadline);
+    EXPECT_EQ(deadline, state_->get_io_deadline);
+    EXPECT_EQ('z', destination);
+}
+
+TEST_F(ValkeySdkTest, ExpiredContextRejectsBeforePoolIoAndCallerAccess) {
+    char source = 'v';
+    char destination = 'x';
+    const std::vector<DataStorageUri> uris{MakeLocation("valkey-primary", "00000000000000000000000000000013", 1)};
+    const DataStorageUri sentinel = MakeLocation("valkey-primary", "ffffffffffffffffffffffffffffffff", 1);
+    auto actual = std::make_shared<std::vector<DataStorageUri>>(1, sentinel);
+    const SdkCallContext expired(std::chrono::steady_clock::time_point::min());
+
+    EXPECT_EQ(ER_SDK_TIMEOUT, sdk_->PutWithContext(uris, {CpuBuffer(&source, 1)}, actual, expired));
+    EXPECT_EQ(ER_SDK_TIMEOUT, sdk_->GetWithContext(uris, {CpuBuffer(&destination, 1)}, expired));
+    EXPECT_EQ(0u, state_->set_calls);
+    EXPECT_EQ(0u, state_->get_calls);
+    EXPECT_EQ('x', destination);
+    EXPECT_EQ(sentinel.ToUriString(), actual->at(0).ToUriString());
+}
+
+TEST_F(ValkeySdkTest, AmbiguousPutMapsToTimeoutAndPreservesOutput) {
+    char source = 'v';
+    const std::vector<DataStorageUri> uris{MakeLocation("valkey-primary", "00000000000000000000000000000014", 1)};
+    const DataStorageUri sentinel = MakeLocation("valkey-primary", "ffffffffffffffffffffffffffffffff", 1);
+    auto actual = std::make_shared<std::vector<DataStorageUri>>(1, sentinel);
+    state_->use_set_results = true;
+    state_->set_results = {EC_IO_ERROR};
+    state_->use_set_certainties = true;
+    state_->set_certainties = {ValkeyWriteCertainty::AMBIGUOUS};
+
+    EXPECT_EQ(ER_SDK_TIMEOUT, sdk_->Put(uris, {CpuBuffer(&source, 1)}, actual));
+    EXPECT_EQ(sentinel.ToUriString(), actual->at(0).ToUriString());
+}
+
+TEST(SdkCallContextTest, MultipleSourceReadGuardsRemainRepeatableAndBlockCancellation) {
+    const SdkCallContext context(std::chrono::steady_clock::now() + std::chrono::seconds(5));
+    auto first_guard = context.TryAcquireCallerMemory();
+    auto second_guard = context.TryAcquireCallerMemory();
+    ASSERT_TRUE(first_guard.has_value());
+    ASSERT_TRUE(second_guard.has_value());
+
+    std::promise<void> cancel_started;
+    auto cancel_started_future = cancel_started.get_future();
+    std::atomic<bool> cancellation_finished{false};
+    std::thread canceller([&] {
+        cancel_started.set_value();
+        context.CancelAndWait();
+        cancellation_finished.store(true, std::memory_order_release);
+    });
+    ASSERT_EQ(std::future_status::ready, cancel_started_future.wait_for(std::chrono::seconds(1)));
+    while (context.IsLive()) {
+        std::this_thread::yield();
+    }
+    EXPECT_FALSE(cancellation_finished.load(std::memory_order_acquire));
+    EXPECT_FALSE(context.TryAcquireCallerMemory().has_value());
+
+    first_guard.reset();
+    EXPECT_FALSE(cancellation_finished.load(std::memory_order_acquire));
+    second_guard.reset();
+    canceller.join();
+    EXPECT_TRUE(cancellation_finished.load(std::memory_order_acquire));
+}
+
+TEST_F(ValkeySdkTest, CancelledContextRejectsCallerMemoryAdmission) {
+    char source = 'v';
+    char destination = 'x';
+    const std::vector<DataStorageUri> uris{
+        MakeLocation("valkey-primary", "00000000000000000000000000000015", 1),
+    };
+    const DataStorageUri sentinel = MakeLocation("valkey-primary", "ffffffffffffffffffffffffffffffff", 1);
+    auto actual = std::make_shared<std::vector<DataStorageUri>>(1, sentinel);
+    const SdkCallContext context(std::chrono::steady_clock::now() + std::chrono::seconds(5));
+    context.Cancel();
+
+    EXPECT_EQ(ER_SDK_TIMEOUT, sdk_->PutWithContext(uris, {CpuBuffer(&source, 1)}, actual, context));
+    state_->get_values = {"z"};
+    EXPECT_EQ(ER_SDK_TIMEOUT, sdk_->GetWithContext(uris, {CpuBuffer(&destination, 1)}, context));
+    EXPECT_EQ(0u, state_->set_calls);
+    EXPECT_EQ(0u, state_->get_calls);
+    EXPECT_EQ('x', destination);
+    EXPECT_EQ(sentinel.ToUriString(), actual->at(0).ToUriString());
+}
+
+TEST_F(ValkeySdkTest, CancellationDuringSourceReadStopsBeforeNextIovAndWaitsForGuard) {
+    char first = 'a';
+    char second = 'b';
+    BlockBuffer source;
+    source.iovs = {
+        Iov{MemoryType::CPU, &first, 1, false},
+        Iov{MemoryType::CPU, &second, 1, false},
+    };
+    const std::vector<DataStorageUri> uris{
+        MakeLocation("valkey-primary", "00000000000000000000000000000016", 2),
+    };
+    auto actual = std::make_shared<std::vector<DataStorageUri>>();
+    const SdkCallContext context(std::chrono::steady_clock::now() + std::chrono::seconds(5));
+
+    std::promise<void> first_iov_read;
+    auto first_iov_read_future = first_iov_read.get_future();
+    std::promise<void> continue_gather;
+    auto continue_gather_future = continue_gather.get_future().share();
+    sdk_->set_source_chunk_hook([&](std::size_t, std::size_t iov_index, std::size_t) {
+        if (iov_index == 0) {
+            first_iov_read.set_value();
+            continue_gather_future.wait();
+        }
+    });
+
+    auto result = std::async(std::launch::async, [&] { return sdk_->PutWithContext(uris, {source}, actual, context); });
+    ASSERT_EQ(std::future_status::ready, first_iov_read_future.wait_for(std::chrono::seconds(1)));
+    context.Cancel();
+    continue_gather.set_value();
+
+    EXPECT_EQ(ER_SDK_TIMEOUT, result.get());
+    context.WaitForCallerMemory();
+    EXPECT_EQ(0u, state_->set_calls);
+    EXPECT_TRUE(actual->empty());
+}
+
+TEST_F(ValkeySdkTest, CancellationDuringOneLargeIovStopsAfterOneBoundedChunk) {
+    constexpr std::size_t kChunkSize = 64 * 1024;
+    std::vector<char> source(4 * kChunkSize, 'v');
+    const std::vector<DataStorageUri> uris{
+        MakeLocation("valkey-primary", "00000000000000000000000000000019", source.size()),
+    };
+    const DataStorageUri sentinel = MakeLocation("valkey-primary", "ffffffffffffffffffffffffffffffff", 1);
+    auto actual = std::make_shared<std::vector<DataStorageUri>>(1, sentinel);
+    const SdkCallContext context(std::chrono::steady_clock::now() + std::chrono::seconds(5));
+    std::promise<void> first_chunk_read;
+    auto first_chunk_read_future = first_chunk_read.get_future();
+    std::promise<void> continue_gather;
+    auto continue_gather_future = continue_gather.get_future().share();
+    std::atomic<std::size_t> copied_bytes{0};
+    sdk_->set_source_chunk_hook([&](std::size_t, std::size_t, std::size_t chunk_size) {
+        const std::size_t total = copied_bytes.fetch_add(chunk_size) + chunk_size;
+        if (total == kChunkSize) {
+            first_chunk_read.set_value();
+            continue_gather_future.wait();
+        }
+    });
+
+    auto result = std::async(std::launch::async, [&] {
+        return sdk_->PutWithContext(uris, {CpuBuffer(source.data(), source.size())}, actual, context);
+    });
+    ASSERT_EQ(std::future_status::ready, first_chunk_read_future.wait_for(std::chrono::seconds(1)));
+    context.Cancel();
+    continue_gather.set_value();
+
+    EXPECT_EQ(ER_SDK_TIMEOUT, result.get());
+    context.WaitForCallerMemory();
+    EXPECT_EQ(kChunkSize, copied_bytes.load());
+    EXPECT_EQ(0u, state_->set_calls);
+    ASSERT_EQ(1u, actual->size());
+    EXPECT_EQ(sentinel.ToUriString(), actual->at(0).ToUriString());
+    EXPECT_FALSE(context.HasAdmittedOutputCommit());
+}
+
+TEST_F(ValkeySdkTest, GetOutputCommitAdmittedBeforeDeadlineFinishesAfterDeadline) {
+    char destination[2] = {'x', 'x'};
+    BlockBuffer output;
+    output.iovs = {
+        Iov{MemoryType::CPU, destination, 1, false},
+        Iov{MemoryType::CPU, destination + 1, 1, false},
+    };
+    const std::vector<DataStorageUri> uris{
+        MakeLocation("valkey-primary", "00000000000000000000000000000017", 2),
+    };
+    state_->get_values = {"ok"};
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
+    const SdkCallContext context(deadline);
+
+    std::promise<void> commit_admitted;
+    auto commit_admitted_future = commit_admitted.get_future();
+    std::promise<void> allow_scatter;
+    auto allow_scatter_future = allow_scatter.get_future().share();
+    sdk_->set_output_commit_hook([&] {
+        commit_admitted.set_value();
+        allow_scatter_future.wait();
+    });
+
+    auto result = std::async(std::launch::async, [&] { return sdk_->GetWithContext(uris, {output}, context); });
+    ASSERT_EQ(std::future_status::ready, commit_admitted_future.wait_for(std::chrono::seconds(1)));
+    std::this_thread::sleep_until(deadline + std::chrono::milliseconds(50));
+    allow_scatter.set_value();
+
+    EXPECT_EQ(ER_OK, result.get());
+    EXPECT_EQ("ok", std::string(destination, sizeof(destination)));
+    context.CancelAndWait();
+}
+
+TEST_F(ValkeySdkTest, PutOutputCommitAdmittedBeforeDeadlineFinishesAfterDeadline) {
+    char source = 'v';
+    const std::vector<DataStorageUri> uris{
+        MakeLocation("valkey-primary", "00000000000000000000000000000018", 1),
+    };
+    auto actual = std::make_shared<std::vector<DataStorageUri>>();
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
+    const SdkCallContext context(deadline);
+
+    std::promise<void> commit_admitted;
+    auto commit_admitted_future = commit_admitted.get_future();
+    std::promise<void> allow_publication;
+    auto allow_publication_future = allow_publication.get_future().share();
+    sdk_->set_output_commit_hook([&] {
+        commit_admitted.set_value();
+        allow_publication_future.wait();
+    });
+
+    auto result = std::async(std::launch::async,
+                             [&] { return sdk_->PutWithContext(uris, {CpuBuffer(&source, 1)}, actual, context); });
+    ASSERT_EQ(std::future_status::ready, commit_admitted_future.wait_for(std::chrono::seconds(1)));
+    std::this_thread::sleep_until(deadline + std::chrono::milliseconds(50));
+    allow_publication.set_value();
+
+    EXPECT_EQ(ER_OK, result.get());
+    ASSERT_EQ(1u, actual->size());
+    EXPECT_EQ(uris[0].ToUriString(), (*actual)[0].ToUriString());
+    context.CancelAndWait();
 }
 
 } // namespace

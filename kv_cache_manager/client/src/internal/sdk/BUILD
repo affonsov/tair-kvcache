@@ -68,7 +68,6 @@ cc_library(
     srcs = [
         "local_file_sdk.cc",
         "sdk_factory.cc",
-        "sdk_interface.cc",
         "sdk_wrapper.cc",
     ] + select({
         ":enable_mooncake": [
@@ -99,8 +98,8 @@ cc_library(
         ":enable_hf3fs": [
             "hf3fs_cuda_util.h",
             "hf3fs_gpu_util_alias.h",
-            "hf3fs_musa_util.h",
             "hf3fs_mempool.h",
+            "hf3fs_musa_util.h",
             "hf3fs_sdk.h",
             "hf3fs_usrbio_api.h",
             "hf3fs_usrbio_client.h",
@@ -109,6 +108,8 @@ cc_library(
     }),
     deps = [
         ":lock_free_thread_pool",
+        ":sdk_common",
+        ":valkey_sdk",
         "//kv_cache_manager/client:common",
         "//kv_cache_manager/client/src/internal/config",
         "//kv_cache_manager/client/src/internal/util",
@@ -214,7 +215,11 @@ cc_library(
         "musa_util.h",
         "sdk_buffer_check_util.h",
     ],
-    linkopts = ["-L/usr/local/musa/lib", "-lmusart", "-Wl,-rpath,/usr/local/musa/lib"],
+    linkopts = [
+        "-L/usr/local/musa/lib",
+        "-lmusart",
+        "-Wl,-rpath,/usr/local/musa/lib",
+    ],
     target_compatible_with = select({
         ":using_musa": [],
         "//conditions:default": ["@platforms//:incompatible"],
