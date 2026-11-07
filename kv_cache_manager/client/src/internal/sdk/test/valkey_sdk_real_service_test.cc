@@ -13,17 +13,11 @@
 namespace kv_cache_manager {
 namespace {
 
-std::string ValkeyEndpoint() {
-    const char *configured_host = std::getenv("KVCM_TEST_REDIS_HOST");
-    const std::string host = configured_host == nullptr ? "127.0.0.1" : configured_host;
-    return "valkey://" + host + ":6379/?db=13";
-}
-
 std::shared_ptr<SdkBackendConfig> RealSdkConfig() { return std::make_shared<ValkeySdkConfig>(); }
 
-std::shared_ptr<StorageConfig> RealStorageConfig() {
+std::shared_ptr<StorageConfig> RealStorageConfig(const std::string &endpoint) {
     auto spec = std::make_shared<ValkeyStorageSpec>();
-    spec->set_endpoint(ValkeyEndpoint());
+    spec->set_endpoint(endpoint);
     return std::make_shared<StorageConfig>(DataStorageType::DATA_STORAGE_TYPE_VALKEY, "vlk04-real", spec);
 }
 
@@ -48,10 +42,20 @@ private:
     const std::vector<std::string> &keys_;
 };
 
-class ValkeySdkRealServiceTest : public TESTBASE {};
+class ValkeySdkRealServiceTest : public TESTBASE {
+public:
+    ValkeySdkRealServiceTest() : server_("vlk04-real", 13) {}
+
+protected:
+    // Plaintext valkey:// endpoints cannot carry credentials, so this suite
+    // starts its own unauthenticated loopback server instead of the shared one.
+    test::SecureValkeyTestServer server_;
+};
 
 TEST_F(ValkeySdkRealServiceTest, MultiSegmentBinaryRoundTrip) {
-    RedisClient cleanup_client(StandardUri::FromUri(ValkeyEndpoint()));
+    ASSERT_TRUE(server_.StartPlaintextWithoutAuthentication());
+    const std::string endpoint = server_.Endpoint("127.0.0.1", false);
+    RedisClient cleanup_client(StandardUri::FromUri(endpoint));
     ASSERT_TRUE(cleanup_client.Open());
 
     const std::vector<DataStorageUri> uris{
@@ -68,7 +72,7 @@ TEST_F(ValkeySdkRealServiceTest, MultiSegmentBinaryRoundTrip) {
     (void)cleanup_client.Delete(redis_keys);
 
     ValkeySdk sdk;
-    ASSERT_EQ(ER_OK, sdk.Init(RealSdkConfig(), RealStorageConfig()));
+    ASSERT_EQ(ER_OK, sdk.Init(RealSdkConfig(), RealStorageConfig(endpoint)));
     std::string put_first("ab\0", 3);
     std::string put_second("cd\xff\x80", 4);
     BlockBuffer put_binary;

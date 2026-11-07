@@ -14,29 +14,34 @@
 namespace kv_cache_manager {
 namespace {
 
-std::string ValkeyEndpoint(int64_t db) {
-    const char *configured_host = std::getenv("KVCM_TEST_REDIS_HOST");
-    const std::string host = configured_host == nullptr ? "127.0.0.1" : configured_host;
-    return "valkey://" + host + ":6379/?db=" + std::to_string(db);
-}
+class ValkeyBackendRealServiceTest : public TESTBASE {
+public:
+    ValkeyBackendRealServiceTest() : server_("vlk03-primary") {}
 
-StorageConfig RealValkeyConfig(const std::string &identity, int64_t db) {
-    auto spec = std::make_shared<ValkeyStorageSpec>();
-    spec->set_endpoint(ValkeyEndpoint(db));
-    return StorageConfig(DataStorageType::DATA_STORAGE_TYPE_VALKEY, identity, spec);
-}
+protected:
+    // Plaintext valkey:// endpoints cannot carry credentials, so this suite
+    // starts its own unauthenticated loopback server instead of the shared one.
+    std::string ValkeyEndpoint(int64_t db) const { return server_.Endpoint("127.0.0.1", false, db); }
 
-std::unique_ptr<RedisClient> OpenFixtureClient(int64_t db) {
-    auto client = std::make_unique<RedisClient>(StandardUri::FromUri(ValkeyEndpoint(db)));
-    if (!client->Open()) {
-        return nullptr;
+    StorageConfig RealValkeyConfig(const std::string &identity, int64_t db) const {
+        auto spec = std::make_shared<ValkeyStorageSpec>();
+        spec->set_endpoint(ValkeyEndpoint(db));
+        return StorageConfig(DataStorageType::DATA_STORAGE_TYPE_VALKEY, identity, spec);
     }
-    return client;
-}
 
-class ValkeyBackendRealServiceTest : public TESTBASE {};
+    std::unique_ptr<RedisClient> OpenFixtureClient(int64_t db) const {
+        auto client = std::make_unique<RedisClient>(StandardUri::FromUri(ValkeyEndpoint(db)));
+        if (!client->Open()) {
+            return nullptr;
+        }
+        return client;
+    }
+
+    test::SecureValkeyTestServer server_;
+};
 
 TEST_F(ValkeyBackendRealServiceTest, ManagesLivenessDeletionAndDbStorageIsolation) {
+    ASSERT_TRUE(server_.StartPlaintextWithoutAuthentication());
     auto metrics_registry = std::make_shared<MetricsRegistry>();
     ValkeyDataStorageBackend backend(metrics_registry);
     ASSERT_EQ(EC_OK, backend.Open(RealValkeyConfig("vlk03-primary", 11), "real-service"));

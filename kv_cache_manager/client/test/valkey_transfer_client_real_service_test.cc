@@ -15,7 +15,6 @@ namespace kv_cache_manager {
 namespace {
 
 constexpr char kStorageName[] = "vlk05-transfer-real";
-constexpr char kValkeyEndpoint[] = "valkey://127.0.0.1:6379/?db=15";
 
 class StorageCleanupGuard {
 public:
@@ -78,11 +77,23 @@ std::string Flatten(const BlockBuffer &buffer) {
     return result;
 }
 
-TEST(ValkeyTransferClientRealServiceTest, PublicTransferClientRoundTripsBinaryCpuBuffers) {
+class ValkeyTransferClientRealServiceTest : public TESTBASE {
+public:
+    ValkeyTransferClientRealServiceTest() : server_(kStorageName, 15) {}
+
+protected:
+    // Plaintext valkey:// endpoints cannot carry credentials, so this suite
+    // starts its own unauthenticated loopback server instead of the shared one.
+    test::SecureValkeyTestServer server_;
+};
+
+TEST_F(ValkeyTransferClientRealServiceTest, PublicTransferClientRoundTripsBinaryCpuBuffers) {
+    ASSERT_TRUE(server_.StartPlaintextWithoutAuthentication());
+    const std::string valkey_endpoint = server_.Endpoint("127.0.0.1", false);
     proto::admin::StorageConfig proto_config;
     proto_config.set_global_unique_name(kStorageName);
     proto_config.set_check_storage_available_when_open(true);
-    proto_config.mutable_valkey()->set_endpoint(kValkeyEndpoint);
+    proto_config.mutable_valkey()->set_endpoint(valkey_endpoint);
 
     StorageConfig storage_config;
     ProtoConvert::StorageFromProto(&proto_config, storage_config);

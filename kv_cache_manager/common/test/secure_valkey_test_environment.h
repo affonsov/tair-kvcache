@@ -39,12 +39,17 @@ public:
 
     bool StartTls();
     bool StartPlaintext();
+    // Plaintext loopback server with no ACL file, so the default user needs no
+    // password. Mirrors integration_test/testlib/redis_server.py for plaintext
+    // valkey:// coverage that cannot carry credentials to an authenticated server.
+    bool StartPlaintextWithoutAuthentication();
     bool StartTlsWithServerExecutableForTest(const std::string &server_executable);
     bool RestartTlsWithRotatedCredentials();
     bool RestartTlsWithMismatchedCertificate();
     void Stop();
 
     std::string Endpoint(const std::string &host = "localhost", bool secure = true) const;
+    std::string Endpoint(const std::string &host, bool secure, int64_t database) const;
     const std::string &security_dir() const { return security_dir_; }
     const std::string &root_dir_for_test() const { return root_dir_; }
     int port_for_test() const { return port_; }
@@ -62,7 +67,8 @@ private:
     bool Start(bool tls,
                bool mismatched_certificate,
                const char *server_executable = nullptr,
-               PortMode port_mode = PortMode::FRESH);
+               PortMode port_mode = PortMode::FRESH,
+               bool authenticated = true);
     bool WriteCredentials();
     bool WriteAcl() const;
 

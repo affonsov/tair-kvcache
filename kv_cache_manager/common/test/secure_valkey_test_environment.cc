@@ -415,7 +415,8 @@ bool SecureValkeyTestServer::WriteAcl() const {
 bool SecureValkeyTestServer::Start(const bool tls,
                                    const bool mismatched_certificate,
                                    const char *server_executable,
-                                   const PortMode port_mode) {
+                                   const PortMode port_mode,
+                                   const bool authenticated) {
     const int preserved_port = port_;
     if (port_mode == PortMode::PRESERVE && !IsPreparedForPreservedStart()) {
         return false;
@@ -441,9 +442,11 @@ bool SecureValkeyTestServer::Start(const bool tls,
                << "daemonize no\n"
                << "databases 16\n"
                << "save \"\"\n"
-               << "appendonly no\n"
-               << "aclfile " << root_dir_ << "/users.acl\n"
-               << "dir " << root_dir_ << "\n"
+               << "appendonly no\n";
+        if (authenticated) {
+            config << "aclfile " << root_dir_ << "/users.acl\n";
+        }
+        config << "dir " << root_dir_ << "\n"
                << "logfile " << log_path << "\n";
         if (tls) {
             const std::string certificate_name = mismatched_certificate ? "mismatch-server" : "server";
@@ -504,6 +507,10 @@ bool SecureValkeyTestServer::StartTls() { return Start(true, false); }
 
 bool SecureValkeyTestServer::StartPlaintext() { return Start(false, false); }
 
+bool SecureValkeyTestServer::StartPlaintextWithoutAuthentication() {
+    return Start(false, false, nullptr, PortMode::FRESH, false);
+}
+
 bool SecureValkeyTestServer::StartTlsWithServerExecutableForTest(const std::string &server_executable) {
     return Start(true, false, server_executable.c_str());
 }
@@ -543,11 +550,15 @@ void SecureValkeyTestServer::Stop() {
 }
 
 std::string SecureValkeyTestServer::Endpoint(const std::string &host, const bool secure) const {
+    return Endpoint(host, secure, database_);
+}
+
+std::string SecureValkeyTestServer::Endpoint(const std::string &host, const bool secure, const int64_t database) const {
     if (port_ <= 0) {
         return {};
     }
     return std::string(secure ? "valkeys://" : "valkey://") + host + ":" + std::to_string(port_) +
-           "/?db=" + std::to_string(database_);
+           "/?db=" + std::to_string(database);
 }
 
 bool SecureValkeyTestServer::CreateSecurityDirectory(const SecurityMaterialVariant variant,
