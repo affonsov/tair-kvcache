@@ -43,7 +43,9 @@ public:
 
     bool operator==(const SdkBackendConfig &other) const {
         return type_ == other.type_ && sdk_log_file_path_ == other.sdk_log_file_path_ &&
-               sdk_log_level_ == other.sdk_log_level_ && spec_byte_sizes_per_block_ == other.spec_byte_sizes_per_block_;
+               sdk_log_level_ == other.sdk_log_level_ &&
+               spec_byte_sizes_per_block_ == other.spec_byte_sizes_per_block_ &&
+               timeout_config_ == other.timeout_config_;
     }
 
     bool operator!=(const SdkBackendConfig &other) const { return !(*this == other); }
@@ -162,7 +164,20 @@ public:
     bool FromRapidValue(const rapidjson::Value &rapid_value) override;
     void ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept override;
 
-    bool operator==(const TairMempoolSdkConfig &other) const { return SdkBackendConfig::operator==(other); }
+    bool operator==(const TairMempoolSdkConfig &other) const {
+        if (!SdkBackendConfig::operator==(other) || shm_fd_ != other.shm_fd_ || shm_size_ != other.shm_size_ ||
+            client_base_ != other.client_base_ || gpu_memory_spans_.size() != other.gpu_memory_spans_.size()) {
+            return false;
+        }
+        for (std::size_t i = 0; i < gpu_memory_spans_.size(); ++i) {
+            const auto &left = gpu_memory_spans_[i];
+            const auto &right = other.gpu_memory_spans_[i];
+            if (left.base != right.base || left.size != right.size || left.device_id != right.device_id) {
+                return false;
+            }
+        }
+        return true;
+    }
 
     bool operator!=(const TairMempoolSdkConfig &other) const { return !(*this == other); }
 
@@ -227,12 +242,20 @@ private:
     // 为什么这里要默认加3个
     std::unordered_map<DataStorageType, std::shared_ptr<SdkBackendConfig>> sdk_backend_configs_map_ = {
         {DataStorageType::DATA_STORAGE_TYPE_HF3FS, std::make_shared<Hf3fsSdkConfig>()},
-        {DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS, std::make_shared<Hf3fsSdkConfig>()},
+        {DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS,
+         [] {
+             auto config = std::make_shared<Hf3fsSdkConfig>();
+             config->set_type(DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS);
+             return config;
+         }()},
         {DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, std::make_shared<TairMempoolSdkConfig>()},
         {DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD,
          std::make_shared<TairMempoolSdkConfig>(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD)},
         {DataStorageType::DATA_STORAGE_TYPE_NFS, std::make_shared<NfsSdkConfig>()}};
     SdkTimeoutConfig timeout_config_;
 };
+
+std::shared_ptr<SdkBackendConfig> CloneSdkBackendConfig(const std::shared_ptr<SdkBackendConfig> &source);
+std::shared_ptr<SdkWrapperConfig> CloneSdkWrapperConfig(const std::shared_ptr<SdkWrapperConfig> &source);
 
 } // namespace kv_cache_manager
