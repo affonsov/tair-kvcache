@@ -1,9 +1,14 @@
 #include <algorithm>
+#include <chrono>
+#include <condition_variable>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -25,6 +30,13 @@ struct FakeRedisState {
     std::vector<int64_t> delete_replies;
     std::vector<int64_t> exists_replies;
     std::vector<std::vector<std::string>> last_commands;
+
+    // Optional I/O gate: while hold_io is set, pipelines block inside the fake
+    // client and keep their pooled connection checked out.
+    std::mutex mutex;
+    std::condition_variable io_cv;
+    bool hold_io = false;
+    std::size_t held_io = 0;
 };
 
 RedisClient::ReplyUPtr MakeIntegerReply(int64_t value) {
@@ -54,6 +66,12 @@ protected:
     bool Reconnect() override { return state_->open_success; }
 
     std::vector<ReplyUPtr> TryExecPipeline(const std::vector<CmdArgs> &commands) override {
+        std::unique_lock lock(state_->mutex);
+        if (state_->hold_io) {
+            ++state_->held_io;
+            state_->io_cv.notify_all();
+            state_->io_cv.wait(lock, [this] { return !state_->hold_io; });
+        }
         ++state_->io_calls;
         state_->last_commands = commands;
         const bool is_delete = !commands.empty() && commands.front().front() == "DEL";
@@ -417,6 +435,59 @@ TEST_F(ValkeyBackendTest, ExistUsesActualRepliesAndConservativeFallbacks) {
     ASSERT_EQ(EC_OK, backend.Close());
     EXPECT_EQ((std::vector<bool>{true, true}), backend.Exist({first, malformed}));
     EXPECT_EQ(2u, state_->exists_calls);
+}
+
+TEST_F(ValkeyBackendTest, ExhaustedClientPoolMapsDeleteToTimeoutAndExistToPresent) {
+    TestValkeyBackend backend(metrics_registry_, state_);
+    ASSERT_EQ(EC_OK, backend.Open(MakeValkeyConfig(), "trace"));
+    const DataStorageUri valid = MakeLocation("valkey-primary", "00000000000000000000000000000001");
+    const DataStorageUri malformed("valkey://valkey-primary/not-hex?size=1");
+    // The backend opens a StaticClientPool with its default of four clients.
+    constexpr std::size_t kPoolSize = 4;
+
+    std::vector<std::thread> holders;
+    auto release_holders = [&] {
+        {
+            std::lock_guard lock(state_->mutex);
+            state_->hold_io = false;
+        }
+        state_->io_cv.notify_all();
+        for (auto &holder : holders) {
+            if (holder.joinable()) {
+                holder.join();
+            }
+        }
+    };
+    struct ReleaseOnExit {
+        std::function<void()> release;
+        ~ReleaseOnExit() { release(); }
+    } release_on_exit{release_holders};
+
+    {
+        std::lock_guard lock(state_->mutex);
+        state_->hold_io = true;
+    }
+    for (std::size_t i = 0; i < kPoolSize; ++i) {
+        holders.emplace_back([&backend, valid] { (void)backend.Exist({valid}); });
+    }
+    {
+        std::unique_lock lock(state_->mutex);
+        ASSERT_TRUE(
+            state_->io_cv.wait_for(lock, std::chrono::seconds(5), [this] { return state_->held_io == kPoolSize; }))
+            << "held=" << state_->held_io;
+    }
+
+    // Every pooled client is checked out, so AcquireClient() times out and returns no client.
+    int callback_count = 0;
+    EXPECT_EQ((std::vector<ErrorCode>{EC_TIMEOUT, EC_BADARGS}),
+              backend.Delete({valid, malformed}, "trace", [&] { ++callback_count; }));
+    EXPECT_EQ(1, callback_count);
+    EXPECT_EQ((std::vector<bool>{true, true}), backend.Exist({valid, malformed}));
+
+    release_holders();
+    std::lock_guard lock(state_->mutex);
+    EXPECT_EQ(0u, state_->delete_calls);
+    EXPECT_EQ(kPoolSize, state_->exists_calls);
 }
 
 TEST_F(ValkeyBackendTest, MightExistLockUnlockAndCopyNeverUseRedis) {
