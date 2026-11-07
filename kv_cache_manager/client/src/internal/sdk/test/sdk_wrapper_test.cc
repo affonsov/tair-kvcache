@@ -19,6 +19,7 @@
 #include "kv_cache_manager/client/src/internal/sdk/sdk_factory.h"
 #include "kv_cache_manager/client/src/internal/sdk/sdk_interface.h"
 #include "kv_cache_manager/client/src/internal/sdk/sdk_wrapper.h"
+#include "kv_cache_manager/common/test/log_capture.h"
 #include "kv_cache_manager/common/unittest.h"
 #include "kv_cache_manager/data_storage/data_storage_uri.h"
 
@@ -135,6 +136,25 @@ TEST_F(SdkWrapperTest, TestInitWithInvalidStorageConfigs) {
     InitParams init_params = init_params_;
     init_params.storage_configs = "[invalid json]";
     ASSERT_EQ(ER_INVALID_STORAGE_CONFIG, sdk_wrapper.Init(client_config_, init_params));
+}
+
+TEST_F(SdkWrapperTest, TestInvalidStorageConfigLogsOnlyByteCount) {
+    const std::string endpoint_sentinel = "valkeys://wrapper-endpoint-sentinel.invalid:16379/?db=3";
+    const std::string directory_sentinel = "/wrapper/security-dir-sentinel";
+    InitParams init_params = init_params_;
+    init_params.storage_configs = R"([{"type":"valkey","storage_spec":{"endpoint":")" + endpoint_sentinel +
+                                  R"(","security_dir":")" + directory_sentinel + R"("},}])";
+
+    test::ScopedLogCapture capture;
+    SdkWrapper sdk_wrapper;
+    EXPECT_EQ(ER_INVALID_STORAGE_CONFIG, sdk_wrapper.Init(client_config_, init_params));
+    const std::string &logs = capture.Stop();
+
+    EXPECT_NE(std::string::npos,
+              logs.find("storage_config_bytes: " + std::to_string(init_params.storage_configs.size())))
+        << logs;
+    EXPECT_EQ(std::string::npos, logs.find("wrapper-endpoint-sentinel")) << logs;
+    EXPECT_EQ(std::string::npos, logs.find(directory_sentinel)) << logs;
 }
 
 TEST_F(SdkWrapperTest, TestPrepareSharedMemoryRegistrationOwnsFd) {

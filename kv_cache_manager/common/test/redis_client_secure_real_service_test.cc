@@ -4,6 +4,8 @@
 #include <cstdio>
 #include <fcntl.h>
 #include <filesystem>
+#include <fstream>
+#include <iterator>
 #include <memory>
 #include <netinet/in.h>
 #include <string>
@@ -15,6 +17,7 @@
 #include <vector>
 
 #include "kv_cache_manager/common/redis_client.h"
+#include "kv_cache_manager/common/test/log_capture.h"
 #include "kv_cache_manager/common/test/secure_valkey_test_environment.h"
 #include "kv_cache_manager/common/unittest.h"
 
@@ -179,6 +182,52 @@ TEST_F(RedisClientSecureRealServiceTest, VerifiesDnsAndIpIdentityAndEnforcesAclS
 
         EXPECT_EQ((std::vector<ErrorCode>{EC_OK}), client.Delete({key}));
         client.Close();
+    }
+}
+
+std::string ReadFileForTest(const std::string &path) {
+    std::ifstream file(path, std::ios::in | std::ios::binary);
+    return std::string(std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>());
+}
+
+std::string TrimTrailingNewline(std::string value) {
+    while (!value.empty() && (value.back() == '\n' || value.back() == '\r')) {
+        value.pop_back();
+    }
+    return value;
+}
+
+TEST_F(RedisClientSecureRealServiceTest, FailedSecureConnectDoesNotLogCredentialsOrSecurityDirectory) {
+    ASSERT_TRUE(server_.StartTls());
+    for (const auto variant : {test::SecurityMaterialVariant::WRONG_USERNAME,
+                               test::SecurityMaterialVariant::WRONG_PASSWORD,
+                               test::SecurityMaterialVariant::WRONG_CA}) {
+        std::string directory;
+        ASSERT_TRUE(server_.CreateSecurityDirectory(variant, directory));
+        const std::string username = TrimTrailingNewline(ReadFileForTest(directory + "/username"));
+        const std::string password = TrimTrailingNewline(ReadFileForTest(directory + "/password"));
+        ASSERT_FALSE(username.empty());
+        ASSERT_FALSE(password.empty());
+
+        test::ScopedLogCapture capture;
+        {
+            RedisClient client(SecureOptions(server_.Endpoint(), directory));
+            EXPECT_FALSE(client.Open());
+            ASSERT_TRUE(client.Prepare());
+            EXPECT_EQ(0u,
+                      client
+                          .SetStringsUntil({AllowedKey("log-check")},
+                                           {"value"},
+                                           std::chrono::steady_clock::now() + std::chrono::seconds(2))
+                          .confirmed_count);
+        }
+        const std::string &logs = capture.Stop();
+
+        EXPECT_FALSE(logs.empty());
+        EXPECT_EQ(std::string::npos, logs.find(password)) << logs;
+        EXPECT_EQ(std::string::npos, logs.find(username)) << logs;
+        EXPECT_EQ(std::string::npos, logs.find(directory)) << logs;
+        EXPECT_EQ(std::string::npos, logs.find(server_.security_dir())) << logs;
     }
 }
 

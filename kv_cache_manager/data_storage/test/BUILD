@@ -9,6 +9,7 @@ cc_test(
     data = [],
     deps = [
         "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/common/test:log_capture",
         "//kv_cache_manager/data_storage",
     ],
 )

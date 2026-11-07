@@ -38,21 +38,6 @@ cc_test(
     ],
 )
 
-py_test(
-    name = "secure_valkey_source_test",
-    size = "small",
-    srcs = ["secure_valkey_source_test.py"],
-    data = [
-        "//kv_cache_manager/client:src/transfer_client_impl.cc",
-        "//kv_cache_manager/client/src/internal/sdk:sdk_wrapper.cc",
-        "//kv_cache_manager/client/src/internal/stub:grpc_stub.cc",
-        "//kv_cache_manager/common:jsonizable.cc",
-        "//kv_cache_manager/common:redis_client.cc",
-        "//kv_cache_manager/manager:cache_manager.cc",
-        "//kv_cache_manager/manager:startup_config_loader.cc",
-    ],
-)
-
 cc_test(
     name = "ValkeyTransferClientTest",
     srcs = [
