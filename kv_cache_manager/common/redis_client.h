@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -7,6 +8,7 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "kv_cache_manager/common/error_code.h"
@@ -14,10 +16,37 @@
 
 namespace kv_cache_manager {
 
+namespace redis_client_internal {
+
+constexpr std::size_t kMaxCommandArguments = 5;
+
+struct CommandView {
+    int argc = 0;
+    std::array<const char *, kMaxCommandArguments> argv{};
+    std::array<std::size_t, kMaxCommandArguments> lengths{};
+};
+
+template <typename... Arguments>
+CommandView BuildCommandView(const Arguments &...arguments) noexcept {
+    static_assert(sizeof...(arguments) <= kMaxCommandArguments, "too many Redis command arguments");
+    const std::array<std::string_view, sizeof...(arguments)> views{std::string_view(arguments)...};
+    CommandView command;
+    command.argc = static_cast<int>(views.size());
+    for (std::size_t i = 0; i < views.size(); ++i) {
+        command.argv[i] = views[i].data();
+        command.lengths[i] = views[i].size();
+    }
+    return command;
+}
+
+} // namespace redis_client_internal
+
+// Per-command outcome for deadline-bounded SET requests.
 enum class ValkeyWriteCertainty : uint8_t {
-    NOT_SENT,
-    CONFIRMED,
-    AMBIGUOUS,
+    NOT_SENT = 0,  // The request was never sent.
+    CONFIRMED = 1, // The server returned exact +OK.
+    AMBIGUOUS = 2, // The request was sent without a definitive reply.
+    REJECTED = 3,  // The server returned a complete Redis error reply.
 };
 
 struct ValkeySetStringsResult {
@@ -27,6 +56,16 @@ struct ValkeySetStringsResult {
     std::size_t confirmed_count = 0;
     std::size_t ambiguous_count = 0;
     std::size_t not_sent_count = 0;
+
+    std::size_t RejectedCount() const {
+        std::size_t count = 0;
+        for (const ValkeyWriteCertainty certainty : certainties) {
+            if (certainty == ValkeyWriteCertainty::REJECTED) {
+                ++count;
+            }
+        }
+        return count;
+    }
 };
 
 struct ValkeyGetStringsResult {
@@ -148,7 +187,21 @@ protected:
     virtual redisContext *AdoptConnectedSocket(int socket_fd);
 
 private:
+    enum class StringCommand : uint8_t {
+        SET,
+        GET,
+    };
+
     class DeadlineWatchdog;
+
+    bool AppendCommand(const redis_client_internal::CommandView &command);
+    ReplyUPtr ExecuteCommand(const redis_client_internal::CommandView &command);
+    ErrorCode ExecuteStringPipeline(StringCommand command,
+                                    const std::vector<std::string> &keys,
+                                    const std::vector<std::string> *values,
+                                    std::size_t begin,
+                                    std::size_t end,
+                                    std::vector<ReplyUPtr> &out_replies);
 
     struct NumericAddress {
         int family = 0;

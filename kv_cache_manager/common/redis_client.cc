@@ -8,6 +8,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstring>
+#include <exception>
 #include <fcntl.h>
 #include <limits>
 #include <mutex>
@@ -78,6 +79,10 @@ bool IsExactStatus(const redisReply *reply, const char *status) {
     const std::size_t length = strlen(status);
     return reply && reply->type == REDIS_REPLY_STATUS && reply->str && reply->len == length &&
            memcmp(reply->str, status, length) == 0;
+}
+
+bool IsRetryableHiredisTransportError(const int error) noexcept {
+    return error == REDIS_ERR_IO || error == REDIS_ERR_EOF || error == REDIS_ERR_TIMEOUT;
 }
 
 template <typename RequestPayloadBytes>
@@ -177,7 +182,11 @@ std::size_t BoundedGetChunkEnd(const std::vector<std::string> &keys,
 
 class RedisClient::DeadlineWatchdog {
 public:
-    explicit DeadlineWatchdog(const Deadline deadline) : deadline_(deadline), thread_([this] { Run(); }) {}
+    DeadlineWatchdog(RedisClient &client, const Deadline deadline)
+        : client_(client)
+        , deadline_(deadline)
+        , uncaught_exceptions_(std::uncaught_exceptions())
+        , thread_([this] { Run(); }) {}
 
     ~DeadlineWatchdog() {
         {
@@ -188,6 +197,9 @@ public:
         thread_.join();
         std::lock_guard<std::mutex> lock(mutex_);
         CloseDuplicate();
+        if (std::uncaught_exceptions() > uncaught_exceptions_) {
+            client_.Disconnect();
+        }
     }
 
     bool Arm(const int socket_fd) {
@@ -234,7 +246,9 @@ private:
         }
     }
 
+    RedisClient &client_;
     Deadline deadline_;
+    int uncaught_exceptions_;
     mutable std::mutex mutex_;
     std::condition_variable cv_;
     int duplicate_fd_ = -1;
@@ -412,76 +426,67 @@ bool RedisClient::ConnectNumericAddressUntil(const NumericAddress &numeric_addre
     if (context_) {
         (void)socket_fd.Release();
     }
-    if (!context_ || context_->err || !watchdog.Arm(context_->fd) || !ApplyRemainingSocketTimeout(deadline)) {
-        Disconnect();
-        watchdog.Disarm();
-        return false;
-    }
 
-    auto command = [this](const std::vector<std::string> &args) {
-        std::vector<const char *> argv;
-        std::vector<std::size_t> lengths;
-        argv.reserve(args.size());
-        lengths.reserve(args.size());
-        for (const std::string &arg : args) {
-            argv.push_back(arg.data());
-            lengths.push_back(arg.size());
-        }
-        return ReplyUPtr(static_cast<redisReply *>(
-                             redisCommandArgv(context_, static_cast<int>(argv.size()), argv.data(), lengths.data())),
-                         freeReplyObject);
-    };
-
-    auto completed_in_time = [&watchdog, deadline] {
-        return std::chrono::steady_clock::now() < deadline && !watchdog.DidExpire();
-    };
     auto fail_connection = [this, &watchdog] {
         Disconnect();
         watchdog.Disarm();
         return false;
     };
+    try {
+        if (!context_ || context_->err || !watchdog.Arm(context_->fd) || !ApplyRemainingSocketTimeout(deadline)) {
+            return fail_connection();
+        }
 
-    ReplyUPtr ping_reply = command({"PING"});
-    if (!completed_in_time() || !ping_reply) {
-        return fail_connection();
-    }
-    if (ping_reply->type == REDIS_REPLY_ERROR) {
-        const std::string error(ping_reply->str ? ping_reply->str : "", ping_reply->len);
-        if (error.compare(0, sizeof("NOAUTH") - 1, "NOAUTH") != 0) {
+        auto completed_in_time = [&watchdog, deadline] {
+            return std::chrono::steady_clock::now() < deadline && !watchdog.DidExpire();
+        };
+
+        ReplyUPtr ping_reply = ExecuteCommand(redis_client_internal::BuildCommandView("PING"));
+        if (!completed_in_time() || !ping_reply) {
             return fail_connection();
         }
-        if (!ApplyRemainingSocketTimeout(deadline)) {
+        if (ping_reply->type == REDIS_REPLY_ERROR) {
+            const std::string error(ping_reply->str ? ping_reply->str : "", ping_reply->len);
+            if (error.compare(0, sizeof("NOAUTH") - 1, "NOAUTH") != 0) {
+                return fail_connection();
+            }
+            if (!ApplyRemainingSocketTimeout(deadline)) {
+                return fail_connection();
+            }
+            ReplyUPtr auth_reply = ExecuteCommand(redis_client_internal::BuildCommandView("AUTH", user_info_));
+            if (!completed_in_time() || !IsExactStatus(auth_reply.get(), "OK")) {
+                return fail_connection();
+            }
+            if (!ApplyRemainingSocketTimeout(deadline)) {
+                return fail_connection();
+            }
+            ping_reply = ExecuteCommand(redis_client_internal::BuildCommandView("PING"));
+            if (!completed_in_time()) {
+                return fail_connection();
+            }
+        }
+        if (!IsExactStatus(ping_reply.get(), "PONG")) {
             return fail_connection();
         }
-        ReplyUPtr auth_reply = command({"AUTH", user_info_});
-        if (!completed_in_time() || !IsExactStatus(auth_reply.get(), "OK")) {
-            return fail_connection();
+
+        if (db_ > 0) {
+            if (!ApplyRemainingSocketTimeout(deadline)) {
+                return fail_connection();
+            }
+            ReplyUPtr select_reply =
+                ExecuteCommand(redis_client_internal::BuildCommandView("SELECT", std::to_string(db_)));
+            if (!completed_in_time() || !IsExactStatus(select_reply.get(), "OK")) {
+                return fail_connection();
+            }
         }
-        if (!ApplyRemainingSocketTimeout(deadline)) {
-            return fail_connection();
-        }
-        ping_reply = command({"PING"});
         if (!completed_in_time()) {
             return fail_connection();
         }
+        return true;
+    } catch (...) {
+        (void)fail_connection();
+        throw;
     }
-    if (!IsExactStatus(ping_reply.get(), "PONG")) {
-        return fail_connection();
-    }
-
-    if (db_ > 0) {
-        if (!ApplyRemainingSocketTimeout(deadline)) {
-            return fail_connection();
-        }
-        ReplyUPtr select_reply = command({"SELECT", std::to_string(db_)});
-        if (!completed_in_time() || !IsExactStatus(select_reply.get(), "OK")) {
-            return fail_connection();
-        }
-    }
-    if (!completed_in_time()) {
-        return fail_connection();
-    }
-    return true;
 }
 
 bool RedisClient::ConnectUntil(const Deadline deadline, DeadlineWatchdog &watchdog) {
@@ -759,18 +764,13 @@ std::vector<ErrorCode> RedisClient::SetStrings(const std::vector<std::string> &k
             return SetStringRequestPayloadBytes(keys[index], values[index]);
         });
 
-        std::vector<CmdArgs> set_cmds;
-        set_cmds.reserve(chunk_end - chunk_begin);
-        for (std::size_t i = chunk_begin; i < chunk_end; ++i) {
-            set_cmds.push_back({"SET", keys[i], values[i]});
-        }
-
         std::vector<ReplyUPtr> set_replies;
-        const ErrorCode pipeline_ec = CommandPipeline(set_cmds, set_replies);
-        if (pipeline_ec != EC_OK || set_replies.size() != set_cmds.size()) {
+        const ErrorCode pipeline_ec =
+            ExecuteStringPipeline(StringCommand::SET, keys, &values, chunk_begin, chunk_end, set_replies);
+        if (pipeline_ec != EC_OK || set_replies.size() != chunk_end - chunk_begin) {
             KVCM_REDIS_LOG_ERROR("redis set strings fail, chunk begin[%zu] commands[%zu] replies[%zu] pipeline_ec[%d]",
                                  chunk_begin,
-                                 set_cmds.size(),
+                                 chunk_end - chunk_begin,
                                  set_replies.size(),
                                  static_cast<int>(pipeline_ec));
             break;
@@ -801,20 +801,17 @@ std::vector<ErrorCode> RedisClient::GetStrings(const std::vector<std::string> &k
             return GetStringRequestPayloadBytes(keys[index]);
         });
 
-        std::vector<CmdArgs> get_cmds;
-        get_cmds.reserve(chunk_end - chunk_begin);
-        for (std::size_t i = chunk_begin; i < chunk_end; ++i) {
-            get_cmds.push_back({"GET", keys[i]});
-        }
-
         std::vector<ReplyUPtr> get_replies;
-        const ErrorCode pipeline_ec = CommandPipeline(get_cmds, get_replies);
-        if (pipeline_ec != EC_OK || get_replies.size() != get_cmds.size()) {
+        const ErrorCode pipeline_ec =
+            ExecuteStringPipeline(StringCommand::GET, keys, nullptr, chunk_begin, chunk_end, get_replies);
+        if (pipeline_ec != EC_OK || get_replies.size() != chunk_end - chunk_begin) {
             KVCM_REDIS_LOG_ERROR("redis get strings fail, chunk begin[%zu] commands[%zu] replies[%zu] pipeline_ec[%d]",
                                  chunk_begin,
-                                 get_cmds.size(),
+                                 chunk_end - chunk_begin,
                                  get_replies.size(),
                                  static_cast<int>(pipeline_ec));
+            const ErrorCode failure = pipeline_ec == EC_OK ? EC_ERROR : pipeline_ec;
+            std::fill(ec_per_key.begin() + chunk_begin, ec_per_key.begin() + chunk_end, failure);
             break;
         }
 
@@ -834,6 +831,93 @@ std::vector<ErrorCode> RedisClient::GetStrings(const std::vector<std::string> &k
         chunk_begin = chunk_end;
     }
     return ec_per_key;
+}
+
+bool RedisClient::AppendCommand(const redis_client_internal::CommandView &command) {
+    std::array<const char *, redis_client_internal::kMaxCommandArguments> argv = command.argv;
+    return redisAppendCommandArgv(context_, command.argc, argv.data(), command.lengths.data()) == REDIS_OK;
+}
+
+RedisClient::ReplyUPtr RedisClient::ExecuteCommand(const redis_client_internal::CommandView &command) {
+    std::array<const char *, redis_client_internal::kMaxCommandArguments> argv = command.argv;
+    return ReplyUPtr(
+        static_cast<redisReply *>(redisCommandArgv(context_, command.argc, argv.data(), command.lengths.data())),
+        freeReplyObject);
+}
+
+ErrorCode RedisClient::ExecuteStringPipeline(const StringCommand command,
+                                             const std::vector<std::string> &keys,
+                                             const std::vector<std::string> *values,
+                                             const std::size_t begin,
+                                             const std::size_t end,
+                                             std::vector<ReplyUPtr> &out_replies) {
+    out_replies.clear();
+    out_replies.reserve(end - begin);
+    for (int32_t attempt = 0; attempt < retry_count_; ++attempt) {
+        if (!IsContextOk() && !Reconnect()) {
+            KVCM_REDIS_LOG_ERROR("fail to reconnect before string pipeline, try count[%d]", attempt);
+            return EC_IO_ERROR;
+        }
+
+        bool append_ok = true;
+        int hiredis_error = REDIS_ERR_OTHER;
+        for (std::size_t i = begin; i < end; ++i) {
+            redis_client_internal::CommandView command_view;
+            if (command == StringCommand::SET) {
+                assert(values != nullptr);
+                command_view = redis_client_internal::BuildCommandView("SET", keys[i], (*values)[i]);
+            } else {
+                command_view = redis_client_internal::BuildCommandView("GET", keys[i]);
+            }
+            if (!AppendCommand(command_view)) {
+                append_ok = false;
+                hiredis_error = context_ ? context_->err : REDIS_ERR_OTHER;
+                break;
+            }
+        }
+        if (!append_ok) {
+            Disconnect();
+            if (!IsRetryableHiredisTransportError(hiredis_error)) {
+                return hiredis_error == REDIS_ERR_PROTOCOL ? EC_CORRUPTION : EC_ERROR;
+            }
+            if (attempt + 1 < retry_count_) {
+                usleep(50 * 1000);
+            }
+            continue;
+        }
+
+        bool replies_ok = true;
+        for (std::size_t i = begin; i < end; ++i) {
+            redisReply *raw_reply = nullptr;
+            if (redisGetReply(context_, reinterpret_cast<void **>(&raw_reply)) != REDIS_OK || !raw_reply) {
+                hiredis_error = context_ ? context_->err : REDIS_ERR_OTHER;
+                KVCM_REDIS_LOG_WARN("redisGetReply failed with hiredis error[%d]", hiredis_error);
+                freeReplyObject(raw_reply);
+                replies_ok = false;
+                break;
+            }
+            out_replies.emplace_back(raw_reply, freeReplyObject);
+        }
+        if (replies_ok) {
+            return EC_OK;
+        }
+
+        out_replies.clear();
+        Disconnect();
+        const bool retryable_transport = IsRetryableHiredisTransportError(hiredis_error);
+        if (command == StringCommand::SET || !retryable_transport) {
+            if (hiredis_error == REDIS_ERR_PROTOCOL) {
+                return EC_CORRUPTION;
+            }
+            return retryable_transport ? EC_IO_ERROR : EC_ERROR;
+        }
+        if (attempt + 1 < retry_count_) {
+            usleep(50 * 1000);
+        }
+    }
+
+    KVCM_REDIS_LOG_ERROR("string pipeline all fail, try count[%ld]", retry_count_);
+    return EC_IO_ERROR;
 }
 
 bool RedisClient::AppendDeadlineCommand(const CmdArgs &cmd) {
@@ -864,6 +948,8 @@ ValkeySetStringsResult RedisClient::SetStringsUntil(const std::vector<std::strin
             switch (certainty) {
             case ValkeyWriteCertainty::CONFIRMED:
                 ++result.confirmed_count;
+                break;
+            case ValkeyWriteCertainty::REJECTED:
                 break;
             case ValkeyWriteCertainty::AMBIGUOUS:
                 ++result.ambiguous_count;
@@ -897,7 +983,7 @@ ValkeySetStringsResult RedisClient::SetStringsUntil(const std::vector<std::strin
         return finish();
     }
 
-    DeadlineWatchdog watchdog(deadline);
+    DeadlineWatchdog watchdog(*this, deadline);
     bool abort = false;
     for (std::size_t chunk_begin = 0; chunk_begin < keys.size() && !abort;) {
         if (std::chrono::steady_clock::now() >= deadline) {
@@ -908,11 +994,6 @@ ValkeySetStringsResult RedisClient::SetStringsUntil(const std::vector<std::strin
         const std::size_t chunk_end = StringPipelineChunkEnd(keys.size(), chunk_begin, [&](const std::size_t index) {
             return SetStringRequestPayloadBytes(keys[index], values[index]);
         });
-        std::vector<CmdArgs> commands;
-        commands.reserve(chunk_end - chunk_begin);
-        for (std::size_t i = chunk_begin; i < chunk_end; ++i) {
-            commands.push_back({"SET", keys[i], values[i]});
-        }
 
         bool appended = false;
         for (int64_t attempt = 0; attempt < retry_count_ && std::chrono::steady_clock::now() < deadline; ++attempt) {
@@ -931,11 +1012,18 @@ ValkeySetStringsResult RedisClient::SetStringsUntil(const std::vector<std::strin
             }
 
             appended = true;
-            for (const CmdArgs &command : commands) {
-                if (!AppendDeadlineCommand(command)) {
-                    appended = false;
-                    break;
+            try {
+                for (std::size_t i = chunk_begin; i < chunk_end; ++i) {
+                    const auto command = redis_client_internal::BuildCommandView("SET", keys[i], values[i]);
+                    if (!AppendCommand(command)) {
+                        appended = false;
+                        break;
+                    }
                 }
+            } catch (...) {
+                Disconnect();
+                watchdog.Disarm();
+                throw;
             }
             if (appended && std::chrono::steady_clock::now() < deadline) {
                 break;
@@ -959,15 +1047,22 @@ ValkeySetStringsResult RedisClient::SetStringsUntil(const std::vector<std::strin
             result.certainties[i] = ValkeyWriteCertainty::AMBIGUOUS;
             result.errors[i] = EC_IO_ERROR;
         }
-        for (std::size_t reply_index = 0; reply_index < commands.size(); ++reply_index) {
+        for (std::size_t reply_index = 0; reply_index < chunk_end - chunk_begin; ++reply_index) {
             redisReply *raw_reply = nullptr;
             const int reply_result = redisGetReply(context_, reinterpret_cast<void **>(&raw_reply));
             ReplyUPtr reply(raw_reply, freeReplyObject);
             const bool completed_in_time = std::chrono::steady_clock::now() < deadline && !watchdog.DidExpire();
             if (reply_result != REDIS_OK || !reply) {
-                result.operation_error = completed_in_time ? EC_IO_ERROR : EC_TIMEOUT;
-                for (std::size_t i = chunk_begin + reply_index; i < result.errors.size(); ++i) {
-                    result.errors[i] = result.operation_error;
+                const std::size_t result_index = chunk_begin + reply_index;
+                if (!completed_in_time) {
+                    result.operation_error = EC_TIMEOUT;
+                    std::fill(result.errors.begin() + result_index, result.errors.end(), EC_TIMEOUT);
+                } else if (context_ && context_->err == REDIS_ERR_PROTOCOL) {
+                    result.operation_error = EC_CORRUPTION;
+                    result.errors[result_index] = EC_CORRUPTION;
+                } else {
+                    result.operation_error = EC_IO_ERROR;
+                    std::fill(result.errors.begin() + result_index, result.errors.end(), EC_IO_ERROR);
                 }
                 Disconnect();
                 watchdog.Disarm();
@@ -990,9 +1085,19 @@ ValkeySetStringsResult RedisClient::SetStringsUntil(const std::vector<std::strin
                 continue;
             }
 
-            result.operation_error = completed_in_time ? EC_ERROR : EC_TIMEOUT;
-            for (std::size_t i = result_index; i < result.errors.size(); ++i) {
-                result.errors[i] = result.operation_error;
+            if (reply->type == REDIS_REPLY_ERROR) {
+                result.certainties[result_index] = ValkeyWriteCertainty::REJECTED;
+                result.errors[result_index] = EC_ERROR;
+                result.operation_error = completed_in_time ? EC_ERROR : EC_TIMEOUT;
+                if (!completed_in_time) {
+                    std::fill(result.errors.begin() + result_index + 1, result.errors.end(), EC_TIMEOUT);
+                }
+            } else if (completed_in_time) {
+                result.operation_error = EC_CORRUPTION;
+                result.errors[result_index] = EC_CORRUPTION;
+            } else {
+                result.operation_error = EC_TIMEOUT;
+                std::fill(result.errors.begin() + result_index, result.errors.end(), EC_TIMEOUT);
             }
             Disconnect();
             watchdog.Disarm();
@@ -1014,10 +1119,11 @@ ValkeySetStringsResult RedisClient::SetStringsUntil(const std::vector<std::strin
         RestoreConfiguredSocketTimeoutOrDisconnect();
     }
     const ValkeySetStringsResult final_result = finish();
-    KVCM_LOG_INFO("valkey set stage[complete] items[%zu] confirmed[%zu] ambiguous[%zu] not_sent[%zu] "
+    KVCM_LOG_INFO("valkey set stage[complete] items[%zu] confirmed[%zu] rejected[%zu] ambiguous[%zu] not_sent[%zu] "
                   "operation_error[%d] deadline_expired[%d]",
                   keys.size(),
                   final_result.confirmed_count,
+                  final_result.RejectedCount(),
                   final_result.ambiguous_count,
                   final_result.not_sent_count,
                   static_cast<int>(final_result.operation_error),
@@ -1063,7 +1169,7 @@ ValkeyGetStringsResult RedisClient::GetStringsUntil(const std::vector<std::strin
         return result;
     }
 
-    DeadlineWatchdog watchdog(deadline);
+    DeadlineWatchdog watchdog(*this, deadline);
     bool abort = false;
     for (std::size_t chunk_begin = 0; chunk_begin < keys.size() && !abort;) {
         if (std::chrono::steady_clock::now() >= deadline) {
@@ -1072,17 +1178,14 @@ ValkeyGetStringsResult RedisClient::GetStringsUntil(const std::vector<std::strin
             break;
         }
         const std::size_t chunk_end = BoundedGetChunkEnd(keys, expected_sizes, expected_size_args, chunk_begin);
-        std::vector<CmdArgs> commands;
-        commands.reserve(chunk_end - chunk_begin);
-        for (std::size_t i = chunk_begin; i < chunk_end; ++i) {
-            commands.push_back({"EVAL_RO", kBoundedGetScript, "1", keys[i], expected_size_args[i]});
-        }
 
         bool completed = false;
         bool deadline_failure = false;
         bool non_retryable_failure = false;
         ErrorCode non_retryable_error = EC_ERROR;
         std::vector<ReplyUPtr> replies;
+        // Allocate reply bookkeeping before hiredis can buffer any command.
+        replies.reserve(chunk_end - chunk_begin);
         for (int64_t attempt = 0; attempt < retry_count_ && std::chrono::steady_clock::now() < deadline; ++attempt) {
             replies.clear();
             if (!context_ || context_->err) {
@@ -1100,11 +1203,19 @@ ValkeyGetStringsResult RedisClient::GetStringsUntil(const std::vector<std::strin
             }
 
             bool append_ok = true;
-            for (const CmdArgs &command : commands) {
-                if (!AppendDeadlineCommand(command)) {
-                    append_ok = false;
-                    break;
+            try {
+                for (std::size_t i = chunk_begin; i < chunk_end; ++i) {
+                    const auto command = redis_client_internal::BuildCommandView(
+                        "EVAL_RO", kBoundedGetScript, "1", keys[i], expected_size_args[i]);
+                    if (!AppendCommand(command)) {
+                        append_ok = false;
+                        break;
+                    }
                 }
+            } catch (...) {
+                Disconnect();
+                watchdog.Disarm();
+                throw;
             }
             if (!append_ok || std::chrono::steady_clock::now() >= deadline) {
                 Disconnect();
@@ -1116,9 +1227,8 @@ ValkeyGetStringsResult RedisClient::GetStringsUntil(const std::vector<std::strin
                 continue;
             }
 
-            replies.reserve(commands.size());
             bool transport_ok = true;
-            for (std::size_t i = 0; i < commands.size(); ++i) {
+            for (std::size_t i = chunk_begin; i < chunk_end; ++i) {
                 redisReply *raw_reply = nullptr;
                 const int reply_result = redisGetReply(context_, reinterpret_cast<void **>(&raw_reply));
                 const bool completed_in_time = std::chrono::steady_clock::now() < deadline && !watchdog.DidExpire();
@@ -1146,8 +1256,8 @@ ValkeyGetStringsResult RedisClient::GetStringsUntil(const std::vector<std::strin
                 }
                 replies.emplace_back(raw_reply, freeReplyObject);
             }
-            if (transport_ok && replies.size() == commands.size() && std::chrono::steady_clock::now() < deadline &&
-                !watchdog.DidExpire()) {
+            if (transport_ok && replies.size() == chunk_end - chunk_begin &&
+                std::chrono::steady_clock::now() < deadline && !watchdog.DidExpire()) {
                 completed = true;
                 break;
             }
