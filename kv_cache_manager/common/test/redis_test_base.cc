@@ -11,7 +11,9 @@ RedisTestBase::ReplyUPtr RedisTestBase::MakeFakeReply(int type, const std::strin
     // callers converting to std::string never dereference nullptr. Only skip
     // setting str for NIL replies where the absence of data is intentional.
     if (type == REDIS_REPLY_STRING || !str.empty()) {
-        r->str = strdup(str.c_str());
+        r->str = static_cast<char *>(malloc(str.size() + 1));
+        memcpy(r->str, str.data(), str.size());
+        r->str[str.size()] = '\0';
         r->len = str.size();
     }
     return ReplyUPtr(r, freeReplyObject);

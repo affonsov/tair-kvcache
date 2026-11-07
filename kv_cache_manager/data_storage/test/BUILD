@@ -88,3 +88,36 @@ cc_test(
         "@com_google_googletest//:gtest_main",
     ],
 )
+
+cc_test(
+    name = "ValkeyBackendTest",
+    srcs = [
+        "valkey_backend_test.cc",
+    ],
+    deps = [
+        "//kv_cache_manager/common:redis_client",
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/data_storage:valkey_backend",
+        "//kv_cache_manager/data_storage:valkey_uri_util",
+        "//kv_cache_manager/metrics:metrics_registry",
+        "@hiredis",
+    ],
+)
+
+cc_test(
+    name = "valkey_backend_real_service_test",
+    srcs = [
+        "valkey_backend_real_service_test.cc",
+    ],
+    tags = [
+        "manual",
+        "valkey",
+    ],
+    deps = [
+        "//kv_cache_manager/common:redis_client",
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/data_storage:valkey_backend",
+        "//kv_cache_manager/data_storage:valkey_uri_util",
+        "//kv_cache_manager/metrics:metrics_registry",
+    ],
+)
