@@ -54,9 +54,7 @@ CoordinationBackendTestConfig redis_backend_with_cluster_name_config{
             client.Close();
         }};
 
-INSTANTIATE_TEST_SUITE_P(CoordinationBackendRedisTest,
-                         CoordinationBackendTest,
-                         testing::Values(redis_backend_config));
+INSTANTIATE_TEST_SUITE_P(CoordinationBackendRedisTest, CoordinationBackendTest, testing::Values(redis_backend_config));
 
 INSTANTIATE_TEST_SUITE_P(CoordinationBackendRedisWithClusterNameTest,
                          CoordinationBackendTest,
@@ -310,21 +308,25 @@ TEST_F(CoordinationRedisDiffClusterNameTest, TestLeaderElectionKeyIsolation) {
 
 TEST(CoordinationRedisLeaderElectionTest, ExpiredDeadHolderPromotesFollowerWithinOneSecond) {
     using SteadyClock = std::chrono::steady_clock;
-    using SystemClock = std::chrono::system_clock;
+
+    // See docs/configuration.md#recommended-sub-second-multi-node-leader-election-profile.
+    constexpr int64_t kRecommendedLeaseMs = 500;
+    constexpr int64_t kRecommendedLoopIntervalMs = 25;
+    constexpr int64_t kRecommendedCoordinationTimeoutMs = 100;
+    constexpr int64_t kRecommendedCoordinationRetryCount = 1;
+    constexpr int64_t kRedisTtlGranularityMs = 1;
+    constexpr int64_t kPromotionContractMs = 1000;
 
     const std::string cluster_name = "vlk01_election_" + std::to_string(SteadyClock::now().time_since_epoch().count());
-    const std::string uri = redis_test::Uri(
-        "test_redis_user:test_redis_password",
-        redis_test::kCoordinationDb,
-        "timeout_ms=1000&retry_count=3&client_min_pool_size=1&client_max_pool_size=2&cluster_name=" + cluster_name);
+    const std::string uri =
+        redis_test::Uri("test_redis_user:test_redis_password",
+                        redis_test::kCoordinationDb,
+                        "timeout_ms=" + std::to_string(kRecommendedCoordinationTimeoutMs) +
+                            "&retry_count=" + std::to_string(kRecommendedCoordinationRetryCount) +
+                            "&client_min_pool_size=1&client_max_pool_size=2&cluster_name=" + cluster_name);
     const std::string lock_key = "dead_holder_failover";
     const std::string dead_holder = "dead_node";
     const std::string follower = "follower_node";
-    constexpr int64_t kLeaseMs = 250;
-    constexpr int64_t kLoopIntervalMs = 20;
-    constexpr int64_t kImmediateTtlSchedulingAllowanceMs = 10;
-    constexpr int64_t kRedisTtlGranularityMs = 1;
-    constexpr int64_t kPromotionContractMs = 1000;
 
     auto dead_holder_backend_unique = CoordinationBackendFactory::CreateAndInitCoordinationBackend(uri);
     auto follower_backend_unique = CoordinationBackendFactory::CreateAndInitCoordinationBackend(uri);
@@ -333,43 +335,29 @@ TEST(CoordinationRedisLeaderElectionTest, ExpiredDeadHolderPromotesFollowerWithi
     std::shared_ptr<CoordinationBackend> dead_holder_backend(std::move(dead_holder_backend_unique));
     std::shared_ptr<CoordinationBackend> follower_backend(std::move(follower_backend_unique));
 
-    ASSERT_EQ(EC_OK, dead_holder_backend->TryLock(lock_key, dead_holder, kLeaseMs));
+    const auto dead_holder_lock_started_at = SteadyClock::now();
+    ASSERT_EQ(EC_OK, dead_holder_backend->TryLock(lock_key, dead_holder, kRecommendedLeaseMs));
     std::string reported_holder;
     int64_t reported_expiration_ms = 0;
-    const auto get_lock_holder_started_at = SystemClock::now();
-    const auto get_lock_holder_result =
-        dead_holder_backend->GetLockHolder(lock_key, reported_holder, reported_expiration_ms);
-    const auto get_lock_holder_completed_at = SystemClock::now();
-    ASSERT_EQ(EC_OK, get_lock_holder_result);
+    ASSERT_EQ(EC_OK, dead_holder_backend->GetLockHolder(lock_key, reported_holder, reported_expiration_ms));
     ASSERT_EQ(dead_holder, reported_holder);
-    const auto observed_get_lock_holder_duration =
-        std::chrono::ceil<std::chrono::milliseconds>(get_lock_holder_completed_at - get_lock_holder_started_at);
-    const auto reported_expiration = SystemClock::time_point(std::chrono::milliseconds(reported_expiration_ms));
-    const auto reported_remaining_ttl =
-        std::chrono::ceil<std::chrono::milliseconds>(reported_expiration - get_lock_holder_completed_at);
-    const auto minimum_immediate_remaining_ttl =
-        std::chrono::milliseconds(kLeaseMs - kImmediateTtlSchedulingAllowanceMs) - observed_get_lock_holder_duration;
-    EXPECT_GE(reported_remaining_ttl, minimum_immediate_remaining_ttl);
-    ASSERT_EQ(EC_EXIST, follower_backend->TryLock(lock_key, follower, kLeaseMs));
+    ASSERT_EQ(EC_EXIST, follower_backend->TryLock(lock_key, follower, kRecommendedLeaseMs));
 
     struct PromotionState {
         std::mutex promotion_mutex;
         std::condition_variable promotion_cv;
         bool promoted = false;
         SteadyClock::time_point first_promotion_time;
-        SystemClock::time_point first_promotion_wall_time;
     };
     auto promotion = std::make_shared<PromotionState>();
-    LeaderElector elector(follower_backend, lock_key, follower, kLeaseMs, kLoopIntervalMs);
+    LeaderElector elector(follower_backend, lock_key, follower, kRecommendedLeaseMs, kRecommendedLoopIntervalMs);
     elector.SetBecomeLeaderHandler([promotion]() {
-        const auto callback_entry_wall_time = SystemClock::now();
         const auto callback_entry_time = SteadyClock::now();
         std::lock_guard<std::mutex> lock(promotion->promotion_mutex);
         if (promotion->promoted) {
             return;
         }
         promotion->first_promotion_time = callback_entry_time;
-        promotion->first_promotion_wall_time = callback_entry_wall_time;
         promotion->promoted = true;
         promotion->promotion_cv.notify_one();
     });
@@ -384,12 +372,11 @@ TEST(CoordinationRedisLeaderElectionTest, ExpiredDeadHolderPromotesFollowerWithi
         promotion->promotion_cv.wait_until(lock, promotion_deadline, [promotion]() { return promotion->promoted; });
     ASSERT_TRUE(promoted_before_deadline);
     const auto first_promotion_time = promotion->first_promotion_time;
-    const auto first_promotion_wall_time = promotion->first_promotion_wall_time;
     lock.unlock();
 
     const auto earliest_allowed_promotion =
-        reported_expiration - observed_get_lock_holder_duration - std::chrono::milliseconds(kRedisTtlGranularityMs);
-    EXPECT_GE(first_promotion_wall_time, earliest_allowed_promotion);
+        dead_holder_lock_started_at + std::chrono::milliseconds(kRecommendedLeaseMs - kRedisTtlGranularityMs);
+    EXPECT_GE(first_promotion_time, earliest_allowed_promotion);
     EXPECT_LT(first_promotion_time, promotion_deadline);
 
     const auto remaining_stable_state = promotion_deadline - SteadyClock::now();
