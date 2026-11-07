@@ -406,7 +406,7 @@ bool SecureValkeyTestServer::WriteAcl() const {
     const std::string key_pattern =
         "kvcm:valkey:" + std::to_string(storage_identity_.size()) + ":" + storage_identity_ + ":*";
     std::string acl = "user default off\nuser " + username_ + " reset on #" + Sha256Hex(password_) + " ~" +
-                      key_pattern + " -@all +ping +select +get +set +del +exists\n";
+                      key_pattern + " -@all +ping +select +get +set +del +exists +getrange +eval_ro\n";
     const bool written = WriteFile(root_dir_ + "/users.acl", acl);
     CleanseString(acl);
     return written;

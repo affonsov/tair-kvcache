@@ -17,6 +17,34 @@ namespace {
 constexpr char kStorageName[] = "vlk05-transfer-real";
 constexpr char kValkeyEndpoint[] = "valkey://127.0.0.1:6379/?db=15";
 
+class StorageCleanupGuard {
+public:
+    StorageCleanupGuard(DataStorageManager &manager,
+                        RequestContext &request_context,
+                        const std::vector<DataStorageUri> &uris)
+        : manager_(manager), request_context_(request_context), uris_(uris) {}
+
+    ~StorageCleanupGuard() noexcept {
+        if (!active_) {
+            return;
+        }
+        try {
+            if (!uris_.empty()) {
+                (void)manager_.Delete(&request_context_, kStorageName, uris_, []() {});
+            }
+            (void)manager_.DoCleanup();
+        } catch (...) {}
+    }
+
+    void Release() noexcept { active_ = false; }
+
+private:
+    DataStorageManager &manager_;
+    RequestContext &request_context_;
+    const std::vector<DataStorageUri> &uris_;
+    bool active_ = true;
+};
+
 std::string ClientConfigJson() {
     return R"({
         "instance_group": "vlk05-test-group",
@@ -65,6 +93,8 @@ TEST(ValkeyTransferClientRealServiceTest, PublicTransferClientRoundTripsBinaryCp
     auto metrics_registry = std::make_shared<MetricsRegistry>();
     DataStorageManager storage_manager(metrics_registry);
     RequestContext request_context("vlk05-transfer-real-service");
+    std::vector<DataStorageUri> storage_uris;
+    StorageCleanupGuard cleanup_guard(storage_manager, request_context, storage_uris);
     ASSERT_EQ(EC_OK, storage_manager.RegisterStorage(&request_context, kStorageName, storage_config));
 
     auto binary_locations = storage_manager.Create(&request_context, kStorageName, {"first", "second"}, 7, []() {});
@@ -72,7 +102,6 @@ TEST(ValkeyTransferClientRealServiceTest, PublicTransferClientRoundTripsBinaryCp
     ASSERT_EQ(2u, binary_locations.size());
     ASSERT_EQ(1u, empty_locations.size());
 
-    std::vector<DataStorageUri> storage_uris;
     UriStrVec locations;
     for (const auto &item : binary_locations) {
         ASSERT_EQ(EC_OK, item.first);
@@ -130,6 +159,7 @@ TEST(ValkeyTransferClientRealServiceTest, PublicTransferClientRoundTripsBinaryCp
               storage_manager.Delete(&request_context, kStorageName, storage_uris, []() {}));
     EXPECT_EQ(std::vector<bool>(storage_uris.size(), false), storage_manager.Exist(kStorageName, storage_uris, false));
     EXPECT_EQ(EC_OK, storage_manager.DoCleanup());
+    cleanup_guard.Release();
 }
 
 constexpr char kSecureStorageName[] = "secure-transfer-real";

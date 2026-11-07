@@ -27,6 +27,7 @@ class StorageQuota(JsonData):
             "ST_NFS",
             "ST_EVENT_REPORT_L1P5",
             "ST_EVENT_REPORT_L2",
+            "ST_VALKEY",
         ]
         if _type not in supported_types:
             raise RuntimeError(

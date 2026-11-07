@@ -1,5 +1,6 @@
 #include <arpa/inet.h>
 #include <cerrno>
+#include <chrono>
 #include <cstdio>
 #include <fcntl.h>
 #include <filesystem>
@@ -339,6 +340,43 @@ TEST(SecureValkeyTestServerTest, OccupiedPreservedPortRejectsUnrelatedListener) 
     EXPECT_TRUE(reservation.AcceptsLoopbackConnection(preserved_port));
 }
 
+TEST_F(RedisClientSecureRealServiceTest, DeadlineReconnectRepeatsTlsAclAndNeverFallsBackToPlaintext) {
+    ASSERT_TRUE(server_.StartTls());
+    RedisClient client(SecureOptions(server_.Endpoint(), server_.security_dir()));
+    ASSERT_TRUE(client.Prepare());
+    const std::string key = AllowedKey("deadline-rotation");
+    const auto deadline = [] { return std::chrono::steady_clock::now() + std::chrono::seconds(5); };
+
+    // No Open(): the first deadline operation must connect through the deadline TLS path.
+    ValkeySetStringsResult first_write = client.SetStringsUntil({key}, {"before"}, deadline());
+    ASSERT_EQ(EC_OK, first_write.operation_error);
+    ASSERT_EQ(1u, first_write.confirmed_count);
+
+    ASSERT_TRUE(server_.RestartTlsWithRotatedCredentials());
+    // A write on the stale pre-restart connection may be ambiguous and is never
+    // replayed; the next operation must reconnect with TLS and the rotated files.
+    ValkeySetStringsResult rotated_write = client.SetStringsUntil({key}, {"after"}, deadline());
+    if (rotated_write.confirmed_count != 1u) {
+        rotated_write = client.SetStringsUntil({key}, {"after"}, deadline());
+    }
+    EXPECT_EQ(1u, rotated_write.confirmed_count);
+    // GetStringsUntil uses EVAL_RO with EXISTS/GETRANGE, so this also proves the
+    // documented ACL allowlist covers bounded reads.
+    const ValkeyGetStringsResult read = client.GetStringsUntil({key}, {5}, deadline());
+    EXPECT_EQ(EC_OK, read.operation_error);
+    EXPECT_EQ((std::vector<ErrorCode>{EC_OK}), read.errors);
+    EXPECT_EQ((std::vector<std::string>{"after"}), read.values);
+    EXPECT_EQ((std::vector<ErrorCode>{EC_OK}), client.Delete({key}));
+
+    ASSERT_TRUE(server_.StartPlaintext());
+    RedisClient secure_to_plaintext(SecureOptions(server_.Endpoint("127.0.0.1", true), server_.security_dir()));
+    ASSERT_TRUE(secure_to_plaintext.Prepare());
+    const ValkeySetStringsResult refused = secure_to_plaintext.SetStringsUntil(
+        {key}, {"never"}, std::chrono::steady_clock::now() + std::chrono::seconds(1));
+    EXPECT_EQ(0u, refused.confirmed_count);
+    EXPECT_NE(EC_OK, refused.operation_error);
+}
+
 TEST_F(RedisClientSecureRealServiceTest, NeverFallsBackBetweenTlsAndPlaintext) {
     ASSERT_TRUE(server_.StartTls());
     RedisClient plaintext(StandardUri::FromUri(server_.Endpoint("127.0.0.1", false)));
@@ -375,7 +413,15 @@ TEST_F(RedisClientSecureRealServiceTest, ReconnectRepeatsTlsAuthSelectPingAndRer
     ASSERT_TRUE(original_password_status.st_dev != rotated_password_status.st_dev ||
                 original_password_status.st_ino != rotated_password_status.st_ino);
 
-    EXPECT_EQ((std::vector<ErrorCode>{EC_OK}), client.SetStrings({key}, {"after"}));
+    // Legacy SET never replays a request that may already have been sent, so the
+    // first write on the stale pre-restart connection may fail. It must leave the
+    // client disconnected so the next call reconnects with TLS, AUTH, SELECT, PING,
+    // and the rotated credential files.
+    const std::vector<ErrorCode> stale_connection_write = client.SetStrings({key}, {"after"});
+    ASSERT_EQ(1u, stale_connection_write.size());
+    if (stale_connection_write.front() != EC_OK) {
+        EXPECT_EQ((std::vector<ErrorCode>{EC_OK}), client.SetStrings({key}, {"after"}));
+    }
     std::vector<std::string> values;
     EXPECT_EQ((std::vector<ErrorCode>{EC_OK}), client.GetStrings({key}, values));
     EXPECT_EQ((std::vector<std::string>{"after"}), values);

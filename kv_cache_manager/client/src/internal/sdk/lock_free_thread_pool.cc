@@ -24,7 +24,25 @@ void LockFreeThreadPool::stop() { pool_->stop(); }
 void LockFreeThreadPool::waitFinish() { pool_->waitFinish(); }
 bool LockFreeThreadPool::isFull() const { return pool_->isFull(); }
 std::future<ClientErrorCode> LockFreeThreadPool::async(std::function<ClientErrorCode()> &&func) {
-    return pool_->async(func);
+    return pool_->async(std::move(func));
+}
+
+LockFreeThreadPool::SubmissionResult LockFreeThreadPool::TryAsync(std::function<ClientErrorCode()> &&func) {
+    auto task = std::make_shared<std::packaged_task<ClientErrorCode()>>(std::move(func));
+    auto future = task->get_future();
+    const auto result = pool_->pushTask([task = std::move(task)] { (*task)(); }, false, false);
+
+    switch (result) {
+    case autil::ThreadPoolBase::ERROR_NONE:
+        return {SubmissionStatus::ACCEPTED, std::move(future)};
+    case autil::ThreadPoolBase::ERROR_POOL_HAS_STOP:
+        return {SubmissionStatus::POOL_STOPPED, {}};
+    case autil::ThreadPoolBase::ERROR_POOL_ITEM_IS_NULL:
+        return {SubmissionStatus::ITEM_IS_NULL, {}};
+    case autil::ThreadPoolBase::ERROR_POOL_QUEUE_FULL:
+        return {SubmissionStatus::QUEUE_FULL, {}};
+    }
+    return {SubmissionStatus::POOL_STOPPED, {}};
 }
 
 } // namespace kv_cache_manager

@@ -195,6 +195,20 @@ cc_test(
 )
 
 cc_test(
+    name = "redis_client_deadline_test",
+    srcs = [
+        "redis_client_deadline_test.cc",
+    ],
+    env = {
+        "KVCM_LOG_TO_CONSOLE": "1",
+    },
+    deps = [
+        "//kv_cache_manager/common:redis_client",
+        "//kv_cache_manager/common:unittest",
+    ],
+)
+
+cc_test(
     name = "redis_client_ext_test",
     srcs = [
         "redis_client_ext_test.cc",

@@ -16,6 +16,15 @@ config_setting(
 )
 
 cc_test(
+    name = "LockFreeThreadPoolTest",
+    srcs = ["lock_free_thread_pool_test.cc"],
+    deps = [
+        "//kv_cache_manager/client/src/internal/sdk:lock_free_thread_pool",
+        "//kv_cache_manager/common:unittest",
+    ],
+)
+
+cc_test(
     name = "ValkeySdkTest",
     srcs = ["valkey_sdk_test.cc"],
     copts = ["-fno-access-control"],
@@ -25,6 +34,28 @@ cc_test(
         "//kv_cache_manager/common:unittest",
         "//kv_cache_manager/data_storage:valkey_uri_util",
     ],
+)
+
+cc_test(
+    name = "ValkeySdkGpuTest",
+    srcs = ["valkey_sdk_gpu_test.cc"],
+    copts = ["-fno-access-control"],
+    target_compatible_with = select({
+        ":using_cuda": [],
+        ":using_musa": [],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
+    deps = [
+        "//kv_cache_manager/client/src/internal/config",
+        "//kv_cache_manager/client/src/internal/sdk",
+        "//kv_cache_manager/client/src/internal/sdk:lock_free_thread_pool",
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/data_storage:valkey_uri_util",
+    ] + select({
+        ":using_cuda": ["@local_config_cuda//cuda"],
+        ":using_musa": ["@local_config_musa//:musa"],
+        "//conditions:default": [],
+    }),
 )
 
 cc_test(
@@ -98,7 +129,7 @@ cc_test(
 
 cc_test(
     name = "SdkTimeoutContractTest",
-    # 用例含 sleep（如 500ms 哨兵检查、3s 慢 fake），用 medium 避免小目标超时。
+    # Tests include sleeps (500 ms sentinels and a 3 s slow fake), so use medium size.
     size = "medium",
     srcs = [
         "fake_slow_sdk.h",

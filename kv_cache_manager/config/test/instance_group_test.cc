@@ -4,6 +4,7 @@
 #include "kv_cache_manager/config/instance_group.h"
 #include "kv_cache_manager/config/meta_indexer_config.h"
 #include "kv_cache_manager/protocol/protobuf/admin_service.pb.h"
+#include "kv_cache_manager/protocol/protobuf/kv_meta_service.pb.h"
 #include "kv_cache_manager/service/util/manager_message_proto_util.h"
 
 namespace kv_cache_manager {
@@ -277,6 +278,8 @@ TEST_F(InstanceGroupTest, ValkeyStorageProtoRoundTripPreservesEndpointAndAvailab
 }
 
 TEST_F(InstanceGroupTest, ValkeyStorageTypeConvertsForAdminAndMetaProtocols) {
+    static_assert(proto::kv_meta::ST_VALKEY == 10);
+
     proto::admin::StorageType admin_type = proto::admin::ST_UNSPECIFIED;
     ProtoConvert::DataStorageTypeToProto(DataStorageType::DATA_STORAGE_TYPE_VALKEY, &admin_type);
     EXPECT_EQ(proto::admin::ST_VALKEY, admin_type);

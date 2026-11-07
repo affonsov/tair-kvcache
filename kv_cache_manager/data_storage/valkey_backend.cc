@@ -72,19 +72,23 @@ std::vector<std::pair<ErrorCode, DataStorageUri>> ValkeyDataStorageBackend::Crea
                                                                                    std::function<void()> cb) {
     std::vector<std::pair<ErrorCode, DataStorageUri>> result(keys.size(), {EC_ERROR, DataStorageUri()});
     if (IsOpen() && IsAvailable()) {
-        std::unordered_set<std::string> batch_ids;
-        for (auto &item : result) {
-            for (std::size_t attempt = 0; attempt < 32; ++attempt) {
-                std::string opaque_id = GenerateOpaqueId();
-                if (!batch_ids.insert(opaque_id).second) {
-                    continue;
+        try {
+            std::unordered_set<std::string> batch_ids;
+            for (auto &item : result) {
+                for (std::size_t attempt = 0; attempt < 32; ++attempt) {
+                    std::string opaque_id = GenerateOpaqueId();
+                    if (!batch_ids.insert(opaque_id).second) {
+                        continue;
+                    }
+                    if (BuildValkeyLocation(storage_identity_, opaque_id, size_per_key, item.second)) {
+                        item.first = EC_OK;
+                        break;
+                    }
+                    batch_ids.erase(opaque_id);
                 }
-                if (BuildValkeyLocation(storage_identity_, opaque_id, size_per_key, item.second)) {
-                    item.first = EC_OK;
-                    break;
-                }
-                batch_ids.erase(opaque_id);
             }
+        } catch (...) {
+            // ID generation failures leave unfinished items in their ordinary error state.
         }
     }
     if (cb) {
@@ -200,9 +204,13 @@ std::shared_ptr<RedisClient> ValkeyDataStorageBackend::CreateClient(const RedisC
 }
 
 std::string ValkeyDataStorageBackend::GenerateOpaqueId() {
-    std::random_device random;
-    const uint64_t high = (static_cast<uint64_t>(random()) << 32) ^ random();
-    const uint64_t low = (static_cast<uint64_t>(random()) << 32) ^ random();
+    thread_local std::mt19937_64 generator = [] {
+        std::random_device entropy;
+        std::seed_seq seed{entropy(), entropy(), entropy(), entropy(), entropy(), entropy(), entropy(), entropy()};
+        return std::mt19937_64(seed);
+    }();
+    const uint64_t high = generator();
+    const uint64_t low = generator();
     std::ostringstream stream;
     stream << std::hex << std::setfill('0') << std::setw(16) << high << std::setw(16) << low;
     return stream.str();

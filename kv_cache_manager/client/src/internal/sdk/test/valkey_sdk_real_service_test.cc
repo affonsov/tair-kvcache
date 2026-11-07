@@ -19,11 +19,7 @@ std::string ValkeyEndpoint() {
     return "valkey://" + host + ":6379/?db=13";
 }
 
-std::shared_ptr<SdkBackendConfig> RealSdkConfig() {
-    auto config = std::make_shared<SdkBackendConfig>();
-    config->set_type(DataStorageType::DATA_STORAGE_TYPE_VALKEY);
-    return config;
-}
+std::shared_ptr<SdkBackendConfig> RealSdkConfig() { return std::make_shared<ValkeySdkConfig>(); }
 
 std::shared_ptr<StorageConfig> RealStorageConfig() {
     auto spec = std::make_shared<ValkeyStorageSpec>();

@@ -1,65 +1,183 @@
-# Client SDK I/O 契约（静态超时预算 / 内部取消 / Buffer 生命周期）
+# Client SDK I/O Contract: Call Context, Hard Deadline, and Buffer Lifetime
 
-## 1. 核心契约（一句话）
+## Core contract
 
-**调用接口不携带任何时间参数；SdkWrapper 在 Init 阶段把自身配置的静态超时预算
-（`sdk_config.timeout_config` 的 get/put_timeout_ms）注入每个后端的
-`SdkBackendConfig::timeout_config()`，后端从自身任务起点起算 deadline，
-预算内完成或内部取消 —— 到点后不得再触碰调用方的 local buffers。**
+`SdkWrapper` creates one root `SdkCallContext` when Get or Put enters the
+wrapper. Each accepted group receives a child context. All children share the
+same absolute `std::chrono::steady_clock` deadline, cancellation flag, and
+caller-memory access gate. Each child owns separate output-commit admission,
+completion, and result state.
 
-各后端按自身能力履约（见 §3 矩阵）。做不到"绝不碰"的后端必须如实声明为 soft 级。
+`GetWithContext` and `PutWithContext` belong to the optional
+`ContextualSdkInterface`. `SdkWrapper` discovers that interface with
+`dynamic_cast`. The existing `SdkInterface` virtual method order does not
+change. Legacy backends continue through the original Get and Put methods and
+use the statically injected timeout configuration.
 
-## 2. 机制分层
+`SdkWrapper::Init` builds its configuration, parsed storage configuration,
+running wait-task pool, SDK map, and optional owned shared-memory file
+descriptor as pending state. It publishes those members only after every SDK is
+created. Get and Put infer successful initialization from the published pool
+and reject calls before publication. A function-static lifecycle read/write
+lock permits concurrent Get and Put calls while serializing Init and
+destruction across wrapper instances. Init after successful initialization is
+rejected.
 
-| 层 | 职责 |
+Context-aware implementations distinguish source-read access from
+output-commit access. Both acquire an RAII guard before dereferencing caller
+memory. An output-commit admission is a result linearization point, but it is
+not a completed result. The guard calls `Complete(ClientErrorCode)` after all
+caller-visible writes and before release. Releasing a guard without Complete
+does not publish a result. Cancellation is published first and then waits for
+active guards, so guarded caller-memory access cannot continue after the
+wrapper returns.
+
+## Layer responsibilities
+
+| Layer | Responsibility |
 |---|---|
-| SdkWrapper | 等待上限 = 入口 + 静态预算；任务从线程池被拾起时做**准入检查**（已过预算的任务拒绝发起 I/O）；Init 时注入预算给后端 |
-| 存储后端 | 从**自身任务起点**起算 deadline（= 起点 + 注入预算）；组级/逐 block/逐 key 准入；超时时执行内部取消 |
+| `SdkWrapper` | Create the root absolute deadline at wrapper entry; create one child context per accepted group; submit with nonblocking `TryAsync`; preserve bounded drain and static timeout injection for legacy SDKs; publish stop and shared cancellation before draining accepted futures; synchronize guarded caller-memory access before every return. |
+| Context-aware storage backend | Consume the unchanged shared absolute deadline for admission and I/O; guard every caller-memory gather, scatter, and output publication; complete each output guard with the published result. |
+| Legacy storage backend | Use the original ABI and statically injected timeout budget; publish no contextual output-commit result; retain the documented hard or soft buffer-lifetime behavior. |
 
-两个起算点的关系：后端起点晚于 wrapper 入口，差值为 wrapper 线程池的排队等待 W_q。
-**排序不变量**：`W_q + 后端内部耗时 ≤ wrapper 预算`。同步调用方（排队为零）
-自然满足；异步调用方依赖排队有界（池线程数配置）。后端内部超时取值应给 W_q
-留出余量 —— PACE 的实践是内部 10s 对 wrapper 15s（5s 余量）。
+Queue time counts against a contextual call's deadline. A backend must not
+derive a new relative timeout when its worker starts.
 
-## 3. 后端履约矩阵
+## Backend contract matrix
 
-| 后端 | 有界性 | 准入检查 | Buffer 级别 | 超时行为 |
+| Backend | Bound | Admission | Buffer lifetime | Timeout behavior |
 |---|---|---|---|---|
-| LocalFile / NFS | 逐 block | 组级 + 逐 block | hard | abort 路径 sync GPU stream（GpuStreamDrainGuard），真取消 |
-| HF3FS | hf3fs_wait_for_ios(abs_timeout) | 逐 block | hard | 数据先落自有 shm iov；超时不执行 CopyIovs；泄漏 iov/IOR 而不 free（free = UAF） |
-| Mooncake | 逐 key 前置检查 | 逐 key | soft | 上游无取消语义；超时路径输出可归因日志（key/buffer/elapsed） |
-| Valkey | Static admission and client-pool deadlines | Batch granularity | soft | Inherited blocking Redis command I/O cannot currently be cancelled or further bounded by the SDK deadline; a late Get does not write to caller buffers; a late Put publishes actual URIs and returns success only when every SET reports `EC_OK` |
-| TairMempool (PACE) | PACE 内部超时（10s） | PACE 自管理 | hard（staging + cancel_and_drain） | **不读取注入的预算**（自行管理内部超时）；要求内部超时 < wrapper 预算（10s < 15s） |
+| LocalFile / NFS | Per block | Group and per block | Hard | The abort path synchronizes its GPU stream through `GpuStreamDrainGuard`; cancellation is real. |
+| HF3FS | `hf3fs_wait_for_ios(abs_timeout)` | Per block | Hard | Data first lands in owned shared-memory IOVs. A timeout does not call `CopyIovs`; submitted IOV/IOR memory is leaked because freeing it would cause a use-after-free. |
+| Mooncake | Check before each key | Per key | Soft | Upstream has no cancellation operation. Timeout logs identify the key, buffer, and elapsed time. |
+| Valkey | One wrapper-entry absolute deadline for pool and socket I/O | Full-request preflight, then bounded slices | Hard | Pool clients are prepared during SDK initialization, so operation-time reconnects use cached numeric addresses. Contextual calls use `AcquireClientUntil`, `SetStringsUntil`, and bounded `EVAL_RO` `GetStringsUntil` with the original deadline. Host and device copies are synchronous and finish before return. |
+| TairMempool (PACE) | PACE internal 10-second timeout | PACE-managed | Hard through staging and `cancel_and_drain` | PACE does not read the injected budget. Its internal timeout must remain below the wrapper's 15-second budget. |
 
-注：PACE 属跨仓库生产路径，本仓库不修改其实现；注入字段对它是纯增量（不读即无行为
-变化），未来若希望显式对齐可读取 `timeout_config()` 校验自身配置。
+PACE is a production path in another repository. This repository does not
+change its implementation. The injected timeout field is additive for PACE.
 
-## 4. Known Limitations
+## Valkey bounded-slice and publication semantics
 
-1. **W_q 残留窗口**：后端 deadline 锚定自身起点，排队等待 W_q 使后端可能晚于
-   wrapper 预算完成（同步调用方无此问题；生产 v6d 路径为同步直调）。后端内部
-   取消机制保证其自身 deadline 之后不再触碰 caller buffer。
-2. **ManagerClient / RTPLLMClient 层**：走 TransferClient 的既有路径，自动获得
-   wrapper 预算，无额外配置。
-3. **超时路径不等在飞任务；普通错误路径有界等待**：RunWithTimeoutParallel 在
-   预算到期时立即返回；在飞任务的 I/O 不被取消（hard 后端的逐块准入会尽快
-   停下；soft 后端见 §3）。普通错误路径则不同：错误往往发生在预算之前，SDK 仍在
-   契约允许的窗口内写 caller buffer，因此错误路径会先置 stop 拦截仍在排队的
-   group（不再发起新 I/O），再有界等待在飞 peer 至多到预算才返回 —— 否则
-   caller 拿到错误后立即复用/释放 buffer，与在飞 DMA 构成数据竞争。
-4. **HF3FS 超时泄漏 iov/IOR**：当 DeadlineExpired 导致 WaitIos 超时时，不释放已
-   提交的 I/O 的 iov 缓冲区和 IOR（释放会导致 UAF）。泄漏规模 = 一次超时的读写
-   调用涉及的 iov 大小。线上应在 WARN 日志中观测泄漏频率，若高频则需引入 3FS
-   取消机制。
-5. **Mooncake 为 soft 级**：超时后在飞的 DMA 无法取消；调用方在收到超时后立即
-   复用相应 buffer 是文档化的数据竞争。逐 key 准入把暴露面从整批降到 ≤1 个在飞
-   key。
-6. **Valkey uses a soft timeout**: Static budgets bound admission and
-   client-pool waits. Inherited blocking Redis command I/O cannot currently be
-   cancelled or further bounded by the SDK deadline. Get checks the deadline
-   again after the command returns; a late Get returns `ER_SDK_TIMEOUT` and does
-   not scatter to caller buffers. Put first validates the result count and each
-   key's result. A late Put publishes `actual_remote_uris` and returns `ER_OK`
-   only when every SET reports `EC_OK`; otherwise, the timed-out operation
-   returns `ER_SDK_TIMEOUT`. Hard Redis socket/I/O deadlines and retry
-   cancellation are outside the current scope.
+Valkey validates the complete request once before acquiring a Redis client or
+performing Redis I/O. Validation covers URI identity and size, accumulated IOV
+size with overflow-safe arithmetic, ignored-I/O rules, caller addresses, and
+memory-type support.
+
+After preflight, Put and Get process contiguous whole-block slices. Each slice
+contains at most 64 blocks and at most 1 MiB of expected payload. Zero-length
+blocks consume a block slot. A block larger than 1 MiB runs alone. Block order
+and IOV order never change.
+
+Put allocates and gathers only the current slice into ordinary owned host
+strings. Each source IOV is gathered by a stateless internal bounded-copy
+helper in chunks no larger than 64 KiB, with a cancellation check between
+chunks. Production supplies the synchronous copy callable directly; the
+helper adds no ValkeySdk data member, virtual method, callback, or runtime
+state. The slice strings are released before the next slice is gathered.
+`SetStringsUntil` receives the unchanged wrapper deadline for every slice. Put stops after the first timeout, ambiguous write,
+server rejection, operation or item error, cancellation, or malformed result
+cardinality. `actual_remote_uris` is published only after every item in every
+slice reports `EC_OK` and `ValkeyWriteCertainty::CONFIRMED`.
+
+Get calls `GetStringsUntil` once per slice and releases that slice's returned
+host strings before requesting the next slice. It preserves block order, IOV
+order, declared-size checks, ignored-IOV offsets, and aggregation of
+non-timeout per-item errors. A timeout or malformed operation result stops
+processing immediately.
+
+Get uses one `OUTPUT_COMMIT` guard. It admits that guard immediately before the
+first actual scatter, keeps it through subsequent deadline-bounded slices, and
+completes it with the final overall result. A request that scatters no bytes
+does not admit an output commit. Once a slice starts scattering under an
+admitted guard, that synchronous scatter finishes without a per-IOV deadline
+check. Before another slice begins I/O, cancellation and the original deadline
+are checked again. Cancellation can therefore wait only for the current
+synchronous copy and any current PR2 deadline-bounded Redis I/O. No host or
+device copy remains in flight after guard release or function return.
+
+Bounded memory requires partial publication for Get: if an earlier successful
+slice has been scattered and a later slice fails or times out, the earlier
+slice remains committed in caller memory. A later slice that fails during Redis
+I/O, and all slices not yet processed, remain untouched. Valid items in a slice
+with non-timeout per-item errors are scattered; failed or wrong-sized items
+remain untouched, and the final result is `ER_SDKREAD_ERROR`. A synchronous
+device-copy failure returns `ER_CUDAMEMCPY_ERROR`; bytes copied earlier in the
+same scatter remain caller-visible.
+
+## Valkey CPU and accelerator IOVs
+
+In CPU-only builds, every nonempty, non-ignored GPU IOV is rejected during the
+full preflight with `ER_UNSUPPORTED_MEMORY_TYPE`, before Redis I/O. Zero-length
+IOVs remain valid and still participate in positional ordering. A nonempty
+ignored Put IOV remains invalid. An ignored Get IOV advances the source offset
+without touching its address.
+
+Under `USING_CUDA`, every nonzero GPU IOV uses
+`cudaPointerGetAttributes` to discover the allocation's owning device, which
+also supports interior allocation pointers. The worker's current device is
+captured, changed only when it differs from the owning device, and restored
+after the synchronous `cudaMemcpyDeviceToHost` or
+`cudaMemcpyHostToDevice`, including copy and device-switch failure paths.
+`USING_MUSA` applies the same sequence with the corresponding MUSA runtime
+APIs. Pointer-attribute, current-device, device-switch, copy, and restoration
+failures map to `ER_CUDAMEMCPY_ERROR`; logs contain only the operation, API,
+and runtime error metadata. Defining CUDA and MUSA together is a compilation
+error.
+
+CPU and GPU IOVs can be mixed in any order, and successive IOVs may belong to
+different devices. Zero-size GPU IOVs and CPU-only IOVs make no accelerator
+runtime calls. Ignored Get GPU IOVs advance the source offset without querying
+or touching their addresses. All device copies are synchronous, and the
+worker's original current device is restored before the contextual call
+returns.
+
+The maintained framework connectors construct CPU IOVs before calling the
+public `TransferClient`; they do not pass framework device buffers directly to
+the Valkey SDK:
+
+- vLLM's `KVCacheDataTransfer._make_block_buffers` creates one
+  `MemoryType.CPU` IOV per block over its host staging pool, which is pinned
+  on CUDA, before `SaveKvCaches` or `LoadKvCaches`.
+- SGLang's `_prepare_buffers` and `_prepare_extra_pool_buffers` create
+  `MemoryType.CPU` IOVs from the connector-provided host page pointers before
+  either transfer call.
+- TensorRT-LLM's `_prepare_buffers` first materializes each cache block with
+  `.cpu()`, then creates a `MemoryType.CPU` IOV. Loads synchronously copy that
+  host tensor back to the framework cache after `LoadKvCaches` returns.
+
+The connector contract therefore requires no duplicate Valkey GPU staging.
+Direct `TransferClient` callers can submit GPU IOVs and receive the synchronous
+Valkey staging behavior above. Final live framework qualification remains
+PR5-owned.
+
+## Result mapping and known limitations
+
+1. Expired or cancelled Valkey work is rejected before pool acquisition or new
+   Redis I/O. Operation-level or per-item `EC_TIMEOUT` maps to
+   `ER_SDK_TIMEOUT`.
+2. `ValkeyWriteCertainty::AMBIGUOUS` maps to `ER_SDK_TIMEOUT`, because remote
+   completion is unknown. `ValkeyWriteCertainty::REJECTED` maps to
+   `ER_SDKWRITE_ERROR`. Malformed cardinality, non-timeout operation/item
+   errors, and `NOT_SENT` items also map to `ER_SDKWRITE_ERROR`.
+3. `RunWithTimeoutParallel` uses nonblocking `TryAsync`. Queue-full and stopped
+   pool rejections do not execute inline. After any task is accepted, timeout,
+   error, rejection, or submission failure publishes stop and shared
+   cancellation before bounded draining. Timeout or an outcome still unknown
+   at the deadline takes precedence over thread-pool and ordinary SDK errors.
+   `ER_TASK_CANCELLED` is internal and is never returned.
+4. A Get result survives wrapper deadline cancellation only when every accepted
+   group has a known completed output commit. One group's commit cannot validate
+   an incomplete or legacy peer.
+5. HF3FS intentionally leaks submitted IOV/IOR memory on timeout because freeing
+   it would cause a use-after-free. Operations should monitor warning frequency
+   until 3FS gains cancellation.
+6. Mooncake remains a soft-lifetime backend. Reusing a timed-out buffer while
+   upstream DMA is still active is a documented data race. Per-key admission
+   limits exposure to at most one in-flight key.
+7. ManagerClient and RTPLLMClient calls that use TransferClient receive the
+   wrapper budget without extra configuration.
+
+TLS, ACLs, `security_dir`, credential loading/references, and authenticated
+live-CI selection remain PR5-owned. PR4 does not duplicate or alter those
+fields, the live Valkey test tags, or the CI workflow that selects authenticated
+coverage.

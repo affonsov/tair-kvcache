@@ -31,3 +31,10 @@ TEST(SdkFactoryTest, TairMempoolDramAndSsdCreateSameSdkType) {
     GTEST_SKIP() << "TairMempool SDK is disabled";
 #endif
 }
+
+TEST(SdkFactoryTest, ValkeyCreatesValkeySdkType) {
+    const auto sdk = SdkFactory::CreateSdkInstance(DataStorageType::DATA_STORAGE_TYPE_VALKEY);
+
+    ASSERT_NE(nullptr, sdk);
+    EXPECT_EQ(SdkType::VALKEY, sdk->Type());
+}

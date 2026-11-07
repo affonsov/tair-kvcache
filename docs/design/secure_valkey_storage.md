@@ -29,7 +29,7 @@ The directory descriptor and validated CA descriptor remain open while the TLS c
 
 The client verifies the CA chain and matches the certificate DNS name or IP SAN against the endpoint host. DNS endpoints also use that host for SNI. The current endpoint host token grammar is one or more letters, digits, dots (`.`), hyphens (`-`), or underscores (`_`), followed by `:<port>`; parsing does not claim that every accepted token is a valid DNS name. IPv4 literals fit this grammar and are accepted. Bracketed IPv6 literals are not supported. Verification cannot be disabled, and a failed TLS connection never falls back to plaintext. The username and password are read again for each new connection or reconnect. Only the endpoint and `security_dir` reference are serialized. Credential values are never placed in source, a URI, JSON, protobuf, a data-location URI, logs, errors, environment variables, or process arguments. Log-oriented string rendering redacts both the endpoint and the directory path.
 
-The ACL user should allow only `PING`, `SELECT`, `GET`, `SET`, `DEL`, and `EXISTS`, deny commands such as `DBSIZE`, and restrict keys to the storage pattern:
+The ACL user should allow only `PING`, `SELECT`, `GET`, `SET`, `DEL`, `EXISTS`, `GETRANGE`, and `EVAL_RO`, deny commands such as `DBSIZE`, and restrict keys to the storage pattern. `EVAL_RO` runs the client's fixed read-only bounded-read script, which calls only `EXISTS` and `GETRANGE` on the declared key; Valkey checks those inner calls against the same ACL user:
 
 ```text
 kvcm:valkey:<storage-name-byte-count>:<storage-name>:*
