@@ -61,8 +61,15 @@ cc_library(
         "//kv_cache_manager/data_storage:common_define",
         "//kv_cache_manager/data_storage:valkey_uri_util",
     ] + select({
-        ":using_cuda": ["@local_config_cuda//cuda"],
-        ":using_musa": ["@local_config_musa//:musa"],
+        # cuda_util.h / musa_util.h come from the buffer-check utility libraries.
+        ":using_cuda": [
+            ":sdk_buffer_check_util",
+            "@local_config_cuda//cuda",
+        ],
+        ":using_musa": [
+            ":sdk_buffer_check_util_musa",
+            "@local_config_musa//:musa",
+        ],
         "//conditions:default": [],
     }),
 )
