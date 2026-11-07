@@ -244,6 +244,18 @@ TEST_F(InstanceGroupTest, EventReportStorageSpecProtoRoundTripPreservesSnapshotS
     EXPECT_NE(std::string::npos, invalid_fields.find("snapshot_delta_drain_timeout_ms"));
 }
 
+TEST_F(InstanceGroupTest, ValkeyStorageToProtoToleratesMissingOrMistypedSpec) {
+    const std::vector<std::shared_ptr<StorageSpec>> specs = {nullptr, std::make_shared<NfsStorageSpec>()};
+    for (const auto &spec : specs) {
+        StorageConfig original(DataStorageType::DATA_STORAGE_TYPE_VALKEY, "valkey_without_spec", spec);
+        proto::admin::StorageConfig proto_config;
+        ProtoConvert::StorageConfigToProto(original, &proto_config);
+        EXPECT_EQ("valkey_without_spec", proto_config.global_unique_name());
+        EXPECT_EQ(proto::admin::ST_VALKEY, proto_config.storage_type());
+        EXPECT_FALSE(proto_config.has_valkey());
+    }
+}
+
 TEST_F(InstanceGroupTest, ValkeyStorageProtoRoundTripPreservesEndpointAndAvailabilityCheck) {
     auto spec = std::make_shared<ValkeyStorageSpec>();
     spec->set_endpoint("valkey://127.0.0.1:6379/?db=7");
