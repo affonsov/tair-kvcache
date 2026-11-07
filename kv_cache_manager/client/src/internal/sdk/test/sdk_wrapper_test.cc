@@ -5,18 +5,20 @@
 #include <future>
 #include <gtest/gtest.h>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <sys/stat.h>
 #include <thread>
+#include <typeinfo>
 #include <unistd.h>
 #include <vector>
 
 #include "kv_cache_manager/client/src/internal/config/sdk_config.h"
 #include "kv_cache_manager/client/src/internal/sdk/deadline_util.h"
-#include "kv_cache_manager/common/lock_free_thread_pool.h"
 #include "kv_cache_manager/client/src/internal/sdk/sdk_factory.h"
 #include "kv_cache_manager/client/src/internal/sdk/sdk_interface.h"
 #include "kv_cache_manager/client/src/internal/sdk/sdk_wrapper.h"
+#include "kv_cache_manager/common/lock_free_thread_pool.h"
 #include "kv_cache_manager/common/unittest.h"
 #include "kv_cache_manager/data_storage/data_storage_uri.h"
 
@@ -154,7 +156,7 @@ TEST_F(SdkWrapperTest, TestPrepareSharedMemoryRegistrationOwnsFd) {
     EXPECT_NE(fd_flags & FD_CLOEXEC, 0);
 
     ASSERT_EQ(fclose(file), 0);
-    struct stat file_stat{};
+    struct stat file_stat {};
     EXPECT_EQ(fstat(prepared_registration.fd, &file_stat), 0);
 }
 
@@ -184,11 +186,12 @@ TEST_F(SdkWrapperTest, TestDestructorKeepsSharedMemoryFdAliveForRunningTasks) {
     auto task_result = sdk_wrapper->wait_task_thread_pool_->async([&]() {
         task_started.set_value();
         allow_task_finish_future.wait();
-        struct stat file_stat{};
+        struct stat file_stat {};
         fd_valid_in_task.store(fstat(owned_fd, &file_stat) == 0);
         return ER_OK;
     });
-    ASSERT_EQ(task_started_future.wait_for(std::chrono::seconds(1)), std::future_status::ready);
+    const auto task_started_status = task_started_future.wait_for(std::chrono::seconds(1));
+    EXPECT_EQ(task_started_status, std::future_status::ready);
 
     std::promise<void> destructor_started;
     auto destructor_started_future = destructor_started.get_future();
@@ -246,8 +249,8 @@ TEST_F(SdkWrapperTest, TestUpdateTairMempoolSdkConfigWithSharedMemory) {
     memory_registrations.host = prepared_registration;
     memory_registrations.gpu.push_back({reinterpret_cast<void *>(0x1000), 4096, 0});
 
-    for (const auto type : {DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL,
-                            DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD}) {
+    for (const auto type :
+         {DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD}) {
         SCOPED_TRACE(static_cast<int>(type));
         auto config = std::make_shared<TairMempoolSdkConfig>(type);
         ASSERT_EQ(ER_OK, sdk_wrapper.UpdateTairMempoolSdkConfig(config, &memory_registrations));
@@ -516,9 +519,21 @@ struct FakeSdkControl {
     // timeout_config 注入 SdkBackendConfig，后端据此自律。
     std::atomic<int> observed_get_budget_ms{0};
     std::atomic<int> observed_put_budget_ms{0};
+    std::atomic<int> contextual_get_calls{0};
+    std::atomic<int64_t> first_deadline_ticks{0};
+    std::atomic<int64_t> second_deadline_ticks{0};
+    std::atomic<int64_t> remaining_ms_at_backend_entry{0};
+    std::atomic<bool> throw_from_get{false};
+    std::atomic<bool> throw_from_put{false};
+    std::atomic<bool> use_context_output_commit{false};
+    std::atomic<bool> output_access_attempted{false};
+    std::atomic<bool> output_access_succeeded{false};
+    std::function<void()> before_output_access;
+    std::function<void()> after_output_access_admitted;
+    std::function<void()> after_output_commit;
 };
 
-class FakeSdk : public SdkInterface {
+class FakeSdk : public SdkInterface, public ContextualSdkInterface {
 public:
     explicit FakeSdk(std::shared_ptr<FakeSdkControl> ctrl) : ctrl_(std::move(ctrl)) {}
 
@@ -539,11 +554,69 @@ public:
         }
         return static_cast<ClientErrorCode>(ctrl_->get_result.load());
     }
-    ClientErrorCode Put(const std::vector<DataStorageUri> &,
+    ClientErrorCode GetWithContext(const std::vector<DataStorageUri> &remote_uris,
+                                   const BlockBuffers &local_buffers,
+                                   const SdkCallContext &context) override {
+        const int call = ctrl_->contextual_get_calls.fetch_add(1);
+        const int64_t deadline_ticks =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(context.deadline().time_since_epoch()).count();
+        if (call == 0) {
+            ctrl_->first_deadline_ticks.store(deadline_ticks);
+        } else if (call == 1) {
+            ctrl_->second_deadline_ticks.store(deadline_ticks);
+        }
+        ctrl_->remaining_ms_at_backend_entry.store(
+            std::chrono::duration_cast<std::chrono::milliseconds>(context.deadline() - std::chrono::steady_clock::now())
+                .count());
+        if (ctrl_->throw_from_get.load()) {
+            throw std::runtime_error("fake SDK task failure");
+        }
+        if (ctrl_->use_context_output_commit.load()) {
+            if (ctrl_->before_output_access) {
+                ctrl_->before_output_access();
+            }
+            ClientErrorCode result = ER_OK;
+            {
+                auto access = context.TryAcquireCallerMemory(SdkCallContext::AccessKind::OUTPUT_COMMIT);
+                ctrl_->output_access_succeeded.store(access.has_value());
+                ctrl_->output_access_attempted.store(true);
+                if (!access) {
+                    return ER_SDK_TIMEOUT;
+                }
+                if (ctrl_->after_output_access_admitted) {
+                    ctrl_->after_output_access_admitted();
+                }
+                result = Get(remote_uris, local_buffers);
+                access->Complete(result);
+            }
+            if (ctrl_->after_output_commit) {
+                ctrl_->after_output_commit();
+            }
+            return result;
+        }
+        return Get(remote_uris, local_buffers);
+    }
+    ClientErrorCode Put(const std::vector<DataStorageUri> &remote_uris,
                         const BlockBuffers &,
-                        std::shared_ptr<std::vector<DataStorageUri>>) override {
+                        std::shared_ptr<std::vector<DataStorageUri>> actual_remote_uris) override {
         ctrl_->put_call_count.fetch_add(1);
+        *actual_remote_uris = remote_uris;
         return ER_OK;
+    }
+    ClientErrorCode PutWithContext(const std::vector<DataStorageUri> &remote_uris,
+                                   const BlockBuffers &local_buffers,
+                                   std::shared_ptr<std::vector<DataStorageUri>> actual_remote_uris,
+                                   const SdkCallContext &context) override {
+        if (ctrl_->throw_from_put.load()) {
+            throw std::runtime_error("fake SDK Put task failure");
+        }
+        auto access = context.TryAcquireCallerMemory(SdkCallContext::AccessKind::OUTPUT_COMMIT);
+        if (!access) {
+            return ER_SDK_TIMEOUT;
+        }
+        const auto result = Put(remote_uris, local_buffers, std::move(actual_remote_uris));
+        access->Complete(result);
+        return result;
     }
 
 protected:
@@ -558,10 +631,25 @@ class FakeSdkFactory : public SdkFactory {
 public:
     explicit FakeSdkFactory(std::shared_ptr<FakeSdkControl> ctrl) : ctrl_(std::move(ctrl)) {}
 
+    void FailOnCreateCall(int call) { fail_on_create_call_ = call; }
+    void AllowAllCreates() { fail_on_create_call_ = -1; }
+    void SetSdkForStorage(const std::string &storage_name, std::shared_ptr<SdkInterface> sdk) {
+        sdk_overrides_[storage_name] = std::move(sdk);
+    }
+
     std::shared_ptr<SdkInterface> CreateSdk(const DataStorageType &type,
                                             const std::shared_ptr<SdkBackendConfig> &sdk_backend_config,
                                             const std::shared_ptr<StorageConfig> &storage_config) override {
-        if (type == DataStorageType::DATA_STORAGE_TYPE_NFS) {
+        const int call = create_calls_++;
+        if (call == fail_on_create_call_) {
+            return nullptr;
+        }
+        const auto override_it = sdk_overrides_.find(storage_config->global_unique_name());
+        if (override_it != sdk_overrides_.end()) {
+            return override_it->second->Init(sdk_backend_config, storage_config) == ER_OK ? override_it->second
+                                                                                          : nullptr;
+        }
+        if (type == DataStorageType::DATA_STORAGE_TYPE_NFS || type == DataStorageType::DATA_STORAGE_TYPE_VALKEY) {
             auto sdk = std::make_shared<FakeSdk>(ctrl_);
             return sdk->Init(sdk_backend_config, storage_config) == ER_OK ? sdk : nullptr;
         }
@@ -570,6 +658,9 @@ public:
 
 private:
     std::shared_ptr<FakeSdkControl> ctrl_;
+    int create_calls_{0};
+    int fail_on_create_call_{-1};
+    std::map<std::string, std::shared_ptr<SdkInterface>> sdk_overrides_;
 };
 
 // Init wrapper with a fake factory injected (-fno-access-control).
@@ -586,7 +677,8 @@ std::unique_ptr<FakeSdkFactory> InitWrapperWithFake(SdkWrapper &wrapper,
 }
 
 // 覆盖 timeout_config 的 ClientConfig（其余字段与 fixture 一致）。
-std::unique_ptr<ClientConfig> MakeClientConfigWithTimeouts(int put_timeout_ms, int get_timeout_ms) {
+std::unique_ptr<ClientConfig>
+MakeClientConfigWithTimeouts(int put_timeout_ms, int get_timeout_ms, int queue_size = 2000, int thread_num = 8) {
     auto client_config = std::make_unique<ClientConfig>();
     std::string client_config_str = R"({
         "instance_group": "group",
@@ -594,12 +686,16 @@ std::unique_ptr<ClientConfig> MakeClientConfigWithTimeouts(int put_timeout_ms, i
         "address": ["127.0.0.1:8080"],
         "block_size": 128,
         "sdk_config": {
-            "thread_num": 8,
-            "queue_size": 2000,
+            "thread_num": )" + std::to_string(thread_num) +
+                                    R"(,
+            "queue_size": )" + std::to_string(queue_size) +
+                                    R"(,
             "sdk_backend_configs": [{"type": "file"}],
             "timeout_config": {
-                "put_timeout_ms": )" + std::to_string(put_timeout_ms) + R"(,
-                "get_timeout_ms": )" + std::to_string(get_timeout_ms) + R"(
+                "put_timeout_ms": )" +
+                                    std::to_string(put_timeout_ms) + R"(,
+                "get_timeout_ms": )" +
+                                    std::to_string(get_timeout_ms) + R"(
             }
         },
         "model_deployment": {
@@ -653,7 +749,7 @@ TEST_F(SdkWrapperTest, TestAdmissionRejectOnExpiredDeadline) {
         std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
 
     // 核心断言：fake SDK 的 Get 从未被调用（I/O 未发起），返回超时，且不等待在飞任务。
-    ASSERT_EQ(ER_SDK_TIMEOUT, ec);
+    ASSERT_EQ(ER_SDK_TIMEOUT_BUFFER_SAFE, ec); // the expired task never started I/O
     ASSERT_EQ(0, ctrl->get_call_count.load());
     ASSERT_LT(elapsed_ms, 400); // 占位任务要 500ms 才结束；若等待它们则此处必超
 
@@ -683,8 +779,8 @@ TEST_F(SdkWrapperTest, TestNoUnboundedWaitOnTimeout) {
     int64_t elapsed_ms =
         std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
 
-    ASSERT_EQ(ER_SDK_TIMEOUT, ec);
-    ASSERT_LT(elapsed_ms, 1000); // 若有人改回"等 in-flight 完成"，此断言会立刻变红
+    ASSERT_EQ(ER_SDK_TIMEOUT_BUFFER_SAFE, ec); // the contextual fake holds no caller-memory guard
+    ASSERT_LT(elapsed_ms, 1000);               // 若有人改回"等 in-flight 完成"，此断言会立刻变红
 
     // 等 fake 的睡眠结束，避免线程池/进程退出时任务仍在跑。
     std::this_thread::sleep_for(std::chrono::milliseconds(1600));
@@ -753,3 +849,817 @@ TEST_F(SdkWrapperTest, TestSplitByPathRecordsIndices) {
     ASSERT_EQ(other.remote_uris[0].ToUriString(), remote_uris[1].ToUriString());
     ASSERT_EQ(other.remote_uris[1].ToUriString(), remote_uris[3].ToUriString());
 }
+
+TEST(SdkInterfaceContextCompatibilityTest, LegacySubclassDoesNotChangeExistingVtable) {
+    TestSplitSdk sdk;
+    SdkInterface *legacy = &sdk;
+
+    EXPECT_EQ(nullptr, dynamic_cast<ContextualSdkInterface *>(legacy));
+    EXPECT_EQ(ER_OK, legacy->Get({}, {}));
+    EXPECT_EQ(ER_OK, legacy->Put({}, {}, std::make_shared<std::vector<DataStorageUri>>()));
+}
+
+TEST_F(SdkWrapperTest, WrapperPassesOneDeadlineToEveryGroup) {
+    auto ctrl = std::make_shared<FakeSdkControl>();
+    SdkWrapper sdk_wrapper;
+    init_params_.storage_configs = R"([
+        {"type":"file","global_unique_name":"nfs_a","storage_spec":{"root_path":"/nfs_a/","key_count_per_file":2}},
+        {"type":"file","global_unique_name":"nfs_b","storage_spec":{"root_path":"/nfs_b/","key_count_per_file":2}}
+    ])";
+    auto client_config = MakeClientConfigWithTimeouts(2000, 2000);
+    ClientErrorCode init_ec = ER_OK;
+    auto fake_factory = InitWrapperWithFake(sdk_wrapper, ctrl, client_config, init_params_, init_ec);
+    ASSERT_EQ(ER_OK, init_ec);
+
+    const std::vector<DataStorageUri> uris{
+        DataStorageUri("file://nfs_a/a?blkid=0&size=0"),
+        DataStorageUri("file://nfs_b/b?blkid=0&size=0"),
+    };
+    ASSERT_EQ(ER_OK, sdk_wrapper.Get(uris, {BlockBuffer(), BlockBuffer()}));
+    ASSERT_EQ(2, ctrl->contextual_get_calls.load());
+    EXPECT_EQ(ctrl->first_deadline_ticks.load(), ctrl->second_deadline_ticks.load());
+}
+
+TEST_F(SdkWrapperTest, QueueTimeConsumesWrapperEntryDeadline) {
+    auto ctrl = std::make_shared<FakeSdkControl>();
+    SdkWrapper sdk_wrapper;
+    auto client_config = MakeClientConfigWithTimeouts(2000, 1000, 1);
+    ClientErrorCode init_ec = ER_OK;
+    auto fake_factory = InitWrapperWithFake(sdk_wrapper, ctrl, client_config, init_params_, init_ec);
+    ASSERT_EQ(ER_OK, init_ec);
+
+    std::promise<void> release;
+    auto release_future = release.get_future().share();
+    std::atomic<int> blockers_started{0};
+    std::vector<std::future<ClientErrorCode>> blockers;
+    for (int i = 0; i < 8; ++i) {
+        blockers.push_back(sdk_wrapper.wait_task_thread_pool_->async([&]() {
+            blockers_started.fetch_add(1);
+            release_future.wait();
+            return ER_OK;
+        }));
+    }
+    const bool blockers_ready = WaitForTrue([&] { return blockers_started.load() == 8; });
+    EXPECT_TRUE(blockers_ready);
+
+    const std::vector<DataStorageUri> uris{
+        DataStorageUri("file://nfs_test/a?blkid=0&size=0"),
+    };
+    auto result = std::async(std::launch::async, [&] { return sdk_wrapper.Get(uris, {BlockBuffer()}); });
+    const bool queue_filled = WaitForTrue([&] { return sdk_wrapper.wait_task_thread_pool_->isFull(); });
+    EXPECT_TRUE(queue_filled);
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    release.set_value();
+    const auto result_code = result.get();
+    sdk_wrapper.wait_task_thread_pool_->waitFinish();
+
+    EXPECT_EQ(ER_OK, result_code);
+    EXPECT_EQ(1, ctrl->contextual_get_calls.load());
+    EXPECT_LT(ctrl->remaining_ms_at_backend_entry.load(), 900);
+    for (auto &blocker : blockers) {
+        EXPECT_EQ(ER_OK, blocker.get());
+    }
+}
+
+TEST_F(SdkWrapperTest, GetAndPutBeforeSuccessfulInitFailClosed) {
+    SdkWrapper sdk_wrapper;
+    const std::vector<DataStorageUri> uris{
+        DataStorageUri("file://nfs_test/a?blkid=0&size=0"),
+    };
+    auto actual = std::make_shared<std::vector<DataStorageUri>>(uris);
+
+    EXPECT_EQ(ER_INVALID_SDKWRAPPER_CONFIG, sdk_wrapper.Get(uris, {BlockBuffer()}));
+    EXPECT_EQ(ER_INVALID_SDKWRAPPER_CONFIG, sdk_wrapper.Put(uris, {BlockBuffer()}, actual));
+    ASSERT_EQ(1u, actual->size());
+    EXPECT_EQ(uris[0].ToUriString(), (*actual)[0].ToUriString());
+}
+
+TEST_F(SdkWrapperTest, EarlyInitFailureLeavesWrapperFailClosed) {
+    SdkWrapper sdk_wrapper;
+    InitParams invalid_params = init_params_;
+    invalid_params.storage_configs = "[]";
+    EXPECT_EQ(ER_INVALID_STORAGE_CONFIG, sdk_wrapper.Init(client_config_, invalid_params));
+
+    const std::vector<DataStorageUri> uris{
+        DataStorageUri("file://nfs_test/a?blkid=0&size=0"),
+    };
+    EXPECT_EQ(ER_INVALID_SDKWRAPPER_CONFIG, sdk_wrapper.Get(uris, {BlockBuffer()}));
+    EXPECT_EQ(nullptr, sdk_wrapper.wait_task_thread_pool_);
+    EXPECT_TRUE(sdk_wrapper.sdk_map_.empty());
+}
+
+TEST_F(SdkWrapperTest, PartialSdkCreationFailureCanRetryWithoutPublishedState) {
+    auto ctrl = std::make_shared<FakeSdkControl>();
+    SdkWrapper sdk_wrapper;
+    init_params_.storage_configs = R"([
+        {"type":"file","global_unique_name":"nfs_a","storage_spec":{"root_path":"/nfs_a/","key_count_per_file":2}},
+        {"type":"file","global_unique_name":"nfs_b","storage_spec":{"root_path":"/nfs_b/","key_count_per_file":2}}
+    ])";
+    auto factory = std::make_unique<FakeSdkFactory>(ctrl);
+    factory->FailOnCreateCall(1);
+    sdk_wrapper.sdk_factory_ = factory.get();
+
+    EXPECT_EQ(ER_CREATESDK_ERROR, sdk_wrapper.Init(client_config_, init_params_));
+    EXPECT_EQ(nullptr, sdk_wrapper.wrapper_config_);
+    EXPECT_TRUE(sdk_wrapper.storage_configs_.empty());
+    EXPECT_EQ(nullptr, sdk_wrapper.wait_task_thread_pool_);
+    EXPECT_TRUE(sdk_wrapper.sdk_map_.empty());
+
+    const std::vector<DataStorageUri> uris{
+        DataStorageUri("file://nfs_a/a?blkid=0&size=0"),
+    };
+    EXPECT_EQ(ER_INVALID_SDKWRAPPER_CONFIG, sdk_wrapper.Get(uris, {BlockBuffer()}));
+
+    factory->AllowAllCreates();
+    EXPECT_EQ(ER_OK, sdk_wrapper.Init(client_config_, init_params_));
+    EXPECT_NE(nullptr, sdk_wrapper.wait_task_thread_pool_);
+    EXPECT_EQ(2u, sdk_wrapper.sdk_map_.size());
+    EXPECT_EQ(ER_OK, sdk_wrapper.Get(uris, {BlockBuffer()}));
+}
+
+TEST_F(SdkWrapperTest, RepeatedSuccessfulInitIsRejectedWithoutMutatingLiveState) {
+    SdkWrapper sdk_wrapper;
+    ASSERT_EQ(ER_OK, sdk_wrapper.Init(client_config_, init_params_));
+    auto original_pool = sdk_wrapper.wait_task_thread_pool_.get();
+    auto original_sdk = sdk_wrapper.sdk_map_.at("nfs_test");
+
+    EXPECT_EQ(ER_INVALID_SDKWRAPPER_CONFIG, sdk_wrapper.Init(client_config_, init_params_));
+    EXPECT_EQ(original_pool, sdk_wrapper.wait_task_thread_pool_.get());
+    EXPECT_EQ(original_sdk, sdk_wrapper.sdk_map_.at("nfs_test"));
+
+    const std::vector<DataStorageUri> uris{
+        DataStorageUri("file://nfs_test/a?blkid=0&size=0"),
+    };
+    EXPECT_NE(ER_INVALID_SDKWRAPPER_CONFIG, sdk_wrapper.Get(uris, {BlockBuffer()}));
+}
+
+TEST_F(SdkWrapperTest, ConcurrentInitSerializesAndPublishesOnlyOneState) {
+    SdkWrapper sdk_wrapper;
+    std::promise<void> start;
+    auto start_future = start.get_future().share();
+    auto first = std::async(std::launch::async, [&] {
+        start_future.wait();
+        return sdk_wrapper.Init(client_config_, init_params_);
+    });
+    auto second = std::async(std::launch::async, [&] {
+        start_future.wait();
+        return sdk_wrapper.Init(client_config_, init_params_);
+    });
+    start.set_value();
+
+    const auto first_result = first.get();
+    const auto second_result = second.get();
+    EXPECT_TRUE((first_result == ER_OK && second_result == ER_INVALID_SDKWRAPPER_CONFIG) ||
+                (second_result == ER_OK && first_result == ER_INVALID_SDKWRAPPER_CONFIG));
+    EXPECT_NE(nullptr, sdk_wrapper.wait_task_thread_pool_);
+    EXPECT_EQ(1u, sdk_wrapper.sdk_map_.size());
+}
+
+TEST_F(SdkWrapperTest, TaskExceptionsMapToOperationErrorsWithoutEscaping) {
+    auto ctrl = std::make_shared<FakeSdkControl>();
+    ctrl->throw_from_get.store(true);
+    SdkWrapper sdk_wrapper;
+    ClientErrorCode init_ec = ER_OK;
+    auto factory = InitWrapperWithFake(sdk_wrapper, ctrl, client_config_, init_params_, init_ec);
+    ASSERT_EQ(ER_OK, init_ec);
+
+    const std::vector<DataStorageUri> uris{
+        DataStorageUri("file://nfs_test/a?blkid=0&size=0"),
+    };
+    EXPECT_EQ(ER_SDK_ERROR_BUFFER_SAFE, sdk_wrapper.Get(uris, {BlockBuffer()}));
+
+    ctrl->throw_from_get.store(false);
+    ctrl->throw_from_put.store(true);
+    auto actual = std::make_shared<std::vector<DataStorageUri>>(uris);
+    EXPECT_EQ(ER_SDK_ERROR_BUFFER_SAFE, sdk_wrapper.Put(uris, {BlockBuffer()}, actual));
+    ASSERT_EQ(1u, actual->size());
+    EXPECT_EQ(uris[0].ToUriString(), (*actual)[0].ToUriString());
+}
+
+TEST_F(SdkWrapperTest, PartialSubmissionRejectsWithoutRunningAcceptedGroupInline) {
+    auto ctrl = std::make_shared<FakeSdkControl>();
+    auto client_config = MakeClientConfigWithTimeouts(2000, 2000, 1, 1);
+    init_params_.storage_configs = R"([
+        {"type":"file","global_unique_name":"nfs_a","storage_spec":{"root_path":"/nfs_a/","key_count_per_file":2}},
+        {"type":"file","global_unique_name":"nfs_b","storage_spec":{"root_path":"/nfs_b/","key_count_per_file":2}},
+        {"type":"file","global_unique_name":"nfs_c","storage_spec":{"root_path":"/nfs_c/","key_count_per_file":2}}
+    ])";
+    SdkWrapper sdk_wrapper;
+    ClientErrorCode init_ec = ER_OK;
+    auto factory = InitWrapperWithFake(sdk_wrapper, ctrl, client_config, init_params_, init_ec);
+    ASSERT_EQ(ER_OK, init_ec);
+
+    std::promise<void> blocker_started;
+    auto blocker_started_future = blocker_started.get_future();
+    std::promise<void> release_blocker;
+    auto release_blocker_future = release_blocker.get_future().share();
+    auto blocker = sdk_wrapper.wait_task_thread_pool_->TryAsync([&] {
+        blocker_started.set_value();
+        release_blocker_future.wait();
+        return ER_OK;
+    });
+    EXPECT_TRUE(blocker.accepted());
+    if (!blocker.accepted()) {
+        release_blocker.set_value();
+        sdk_wrapper.wait_task_thread_pool_->waitFinish();
+        return;
+    }
+    const auto blocker_started_status = blocker_started_future.wait_for(std::chrono::seconds(1));
+    EXPECT_EQ(std::future_status::ready, blocker_started_status);
+
+    const std::vector<DataStorageUri> uris{
+        DataStorageUri("file://nfs_a/a?blkid=0&size=0"),
+        DataStorageUri("file://nfs_b/b?blkid=0&size=0"),
+        DataStorageUri("file://nfs_c/c?blkid=0&size=0"),
+    };
+    auto result = std::async(std::launch::async, [&] {
+        return sdk_wrapper.Get(uris, {BlockBuffer(), BlockBuffer(), BlockBuffer()});
+    });
+    const bool queue_filled = WaitForTrue([&] { return sdk_wrapper.wait_task_thread_pool_->isFull(); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    EXPECT_EQ(0, ctrl->get_call_count.load());
+    release_blocker.set_value();
+    const auto result_code = result.get();
+    const auto blocker_code = blocker.future.get();
+    sdk_wrapper.wait_task_thread_pool_->waitFinish();
+
+    EXPECT_TRUE(queue_filled);
+    EXPECT_EQ(ER_SDK_ERROR_BUFFER_SAFE, result_code); // the rejected group never ran
+    EXPECT_EQ(ER_OK, blocker_code);
+    EXPECT_EQ(0, ctrl->get_call_count.load());
+}
+
+TEST(SdkCallContextTest, SecondOutputAdmissionIsRejectedWithoutTrackingAnotherCaller) {
+    const SdkCallContext context(std::chrono::steady_clock::now() + std::chrono::seconds(5));
+    auto first = context.TryAcquireCallerMemory(SdkCallContext::AccessKind::OUTPUT_COMMIT);
+    ASSERT_TRUE(first.has_value());
+
+    EXPECT_FALSE(context.TryAcquireCallerMemory(SdkCallContext::AccessKind::OUTPUT_COMMIT).has_value());
+
+    first.reset();
+    context.CancelAndWait();
+}
+
+TEST(SdkCallContextTest, CompletedOutputCommitIsPublishedBeforeGuardRelease) {
+    const SdkCallContext context(std::chrono::steady_clock::now() + std::chrono::seconds(1));
+    {
+        auto access = context.TryAcquireCallerMemory(SdkCallContext::AccessKind::OUTPUT_COMMIT);
+        ASSERT_TRUE(access.has_value());
+        EXPECT_TRUE(context.HasAdmittedOutputCommit());
+        EXPECT_FALSE(context.CompletedOutputCommit().has_value());
+        access->Complete(ER_OK);
+    }
+
+    context.WaitForCallerMemory();
+    ASSERT_TRUE(context.CompletedOutputCommit().has_value());
+    EXPECT_EQ(ER_OK, *context.CompletedOutputCommit());
+}
+
+TEST(SdkCallContextTest, FirstCompletedOutputResultIsImmutable) {
+    const SdkCallContext context(std::chrono::steady_clock::now() + std::chrono::seconds(1));
+    auto access = context.TryAcquireCallerMemory(SdkCallContext::AccessKind::OUTPUT_COMMIT);
+    ASSERT_TRUE(access.has_value());
+
+    access->Complete(ER_OK);
+    access->Complete(ER_SDK_TIMEOUT);
+
+    ASSERT_TRUE(context.CompletedOutputCommit().has_value());
+    EXPECT_EQ(ER_OK, *context.CompletedOutputCommit());
+}
+
+TEST(SdkCallContextTest, DestroyedIncompleteOutputGuardBlocksReadmission) {
+    const SdkCallContext context(std::chrono::steady_clock::now() + std::chrono::seconds(1));
+    {
+        auto access = context.TryAcquireCallerMemory(SdkCallContext::AccessKind::OUTPUT_COMMIT);
+        ASSERT_TRUE(access.has_value());
+    }
+
+    context.WaitForCallerMemory();
+    EXPECT_TRUE(context.HasAdmittedOutputCommit());
+    EXPECT_FALSE(context.CompletedOutputCommit().has_value());
+    EXPECT_FALSE(context.TryAcquireCallerMemory(SdkCallContext::AccessKind::OUTPUT_COMMIT).has_value());
+}
+
+TEST_F(SdkWrapperTest, SingleGroupCommitCompletingDuringCancellationPreservesSuccess) {
+    auto ctrl = std::make_shared<FakeSdkControl>();
+    ctrl->use_context_output_commit.store(true);
+    auto client_config = MakeClientConfigWithTimeouts(2000, 2000);
+    SdkWrapper sdk_wrapper;
+    ClientErrorCode init_ec = ER_OK;
+    auto factory = InitWrapperWithFake(sdk_wrapper, ctrl, client_config, init_params_, init_ec);
+    ASSERT_EQ(ER_OK, init_ec);
+
+    std::promise<void> commit_completed;
+    auto commit_completed_future = commit_completed.get_future();
+    std::promise<void> allow_callable_return;
+    auto allow_callable_return_future = allow_callable_return.get_future().share();
+    ctrl->after_output_commit = [&] {
+        commit_completed.set_value();
+        allow_callable_return_future.wait();
+    };
+
+    const std::vector<DataStorageUri> uris{
+        DataStorageUri("file://nfs_test/a?blkid=0&size=0"),
+    };
+    const auto deadline_watchdog = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    auto result = std::async(std::launch::async, [&] { return sdk_wrapper.Get(uris, {BlockBuffer()}); });
+    const auto commit_completed_status = commit_completed_future.wait_until(deadline_watchdog);
+    EXPECT_EQ(std::future_status::ready, commit_completed_status);
+    const auto result_status = result.wait_for(std::chrono::seconds(5));
+    EXPECT_EQ(std::future_status::ready, result_status);
+    allow_callable_return.set_value();
+    const auto result_code = result.get();
+    sdk_wrapper.wait_task_thread_pool_->waitFinish();
+
+    EXPECT_EQ(ER_OK, result_code);
+    EXPECT_TRUE(ctrl->output_access_succeeded.load());
+    EXPECT_EQ(1, ctrl->get_call_count.load());
+}
+
+TEST_F(SdkWrapperTest, QueuedWorkerCannotAcquireCallerMemoryAfterWrapperReturns) {
+    auto ctrl = std::make_shared<FakeSdkControl>();
+    ctrl->use_context_output_commit.store(true);
+    auto client_config = MakeClientConfigWithTimeouts(2000, 2000);
+    SdkWrapper sdk_wrapper;
+    ClientErrorCode init_ec = ER_OK;
+    auto factory = InitWrapperWithFake(sdk_wrapper, ctrl, client_config, init_params_, init_ec);
+    ASSERT_EQ(ER_OK, init_ec);
+
+    std::promise<void> worker_paused;
+    auto worker_paused_future = worker_paused.get_future();
+    std::promise<void> allow_access;
+    auto allow_access_future = allow_access.get_future().share();
+    ctrl->before_output_access = [&] {
+        worker_paused.set_value();
+        allow_access_future.wait();
+    };
+
+    const std::vector<DataStorageUri> uris{
+        DataStorageUri("file://nfs_test/a?blkid=0&size=0"),
+    };
+    auto result = std::async(std::launch::async, [&] { return sdk_wrapper.Get(uris, {BlockBuffer()}); });
+    const auto worker_paused_status = worker_paused_future.wait_for(std::chrono::seconds(5));
+    EXPECT_EQ(std::future_status::ready, worker_paused_status);
+    const auto result_status = result.wait_for(std::chrono::seconds(5));
+    EXPECT_EQ(std::future_status::ready, result_status);
+
+    allow_access.set_value();
+    const auto result_code = result.get();
+    sdk_wrapper.wait_task_thread_pool_->waitFinish();
+
+    EXPECT_EQ(ER_SDK_TIMEOUT_BUFFER_SAFE, result_code); // the queued worker never acquired caller memory
+    EXPECT_TRUE(ctrl->output_access_attempted.load());
+    EXPECT_FALSE(ctrl->output_access_succeeded.load());
+    EXPECT_EQ(0, ctrl->get_call_count.load());
+}
+
+namespace {
+
+struct SdkWrapperLayoutBaseline {
+    SdkFactory *sdk_factory;
+    std::shared_ptr<SdkWrapperConfig> wrapper_config;
+    std::vector<std::shared_ptr<StorageConfig>> storage_configs;
+    std::unique_ptr<LockFreeThreadPool> wait_task_thread_pool;
+    std::map<std::string, std::shared_ptr<SdkInterface>> sdk_map;
+    int owned_shm_fd;
+};
+
+static_assert(sizeof(SdkWrapper) == sizeof(SdkWrapperLayoutBaseline));
+static_assert(sizeof(SdkInterface) == sizeof(void *));
+
+std::unique_ptr<LockFreeThreadPool> MakeStartedPool(std::size_t thread_num = 2, std::size_t queue_size = 8) {
+    auto pool = std::make_unique<LockFreeThreadPool>(thread_num, queue_size, "SdkWrapperOutcomeTestPool");
+    EXPECT_TRUE(pool->start());
+    return pool;
+}
+
+TEST(SdkWrapperOutcomeTest, CompletedSingleGroupCommitWinsWithoutFutureReadinessRace) {
+    SdkWrapper wrapper;
+    wrapper.wait_task_thread_pool_ = MakeStartedPool();
+    const SdkCallContext root(std::chrono::steady_clock::now() + std::chrono::seconds(2));
+    std::promise<void> commit_completed;
+    auto commit_completed_future = commit_completed.get_future();
+    std::promise<void> allow_callable_return;
+    auto allow_callable_return_future = allow_callable_return.get_future().share();
+
+    std::vector<std::function<ClientErrorCode(const SdkCallContext &)>> tasks;
+    tasks.push_back([&](const SdkCallContext &task_context) {
+        {
+            auto guard = task_context.TryAcquireCallerMemory(SdkCallContext::AccessKind::OUTPUT_COMMIT);
+            if (!guard) {
+                return ER_SDK_TIMEOUT;
+            }
+            guard->Complete(ER_OK);
+        }
+        commit_completed.set_value();
+        allow_callable_return_future.wait();
+        return ER_OK;
+    });
+
+    auto result = std::async(std::launch::async, [&] {
+        return wrapper.RunWithTimeoutParallel(SdkWrapper::OpType::GET, std::move(tasks), root);
+    });
+    const auto commit_completed_status = commit_completed_future.wait_for(std::chrono::seconds(5));
+    EXPECT_EQ(std::future_status::ready, commit_completed_status);
+    const auto result_status = result.wait_for(std::chrono::seconds(5));
+    EXPECT_EQ(std::future_status::ready, result_status);
+    allow_callable_return.set_value();
+    const auto result_code = result.get();
+    wrapper.wait_task_thread_pool_->waitFinish();
+
+    EXPECT_EQ(ER_OK, result_code);
+}
+
+TEST(SdkWrapperOutcomeTest, OneCommittedGroupCannotPreserveLegacyPeerAtDeadline) {
+    SdkWrapper wrapper;
+    wrapper.wait_task_thread_pool_ = MakeStartedPool();
+    const SdkCallContext root(std::chrono::steady_clock::now() + std::chrono::seconds(2));
+    std::promise<void> legacy_access_started;
+    auto legacy_access_started_future = legacy_access_started.get_future();
+    std::promise<void> release_legacy_access;
+    auto release_legacy_access_future = release_legacy_access.get_future().share();
+
+    std::vector<std::function<ClientErrorCode(const SdkCallContext &)>> tasks;
+    tasks.push_back([](const SdkCallContext &task_context) {
+        auto guard = task_context.TryAcquireCallerMemory(SdkCallContext::AccessKind::OUTPUT_COMMIT);
+        if (!guard) {
+            return ER_SDK_TIMEOUT;
+        }
+        guard->Complete(ER_OK);
+        return ER_OK;
+    });
+    tasks.push_back([&](const SdkCallContext &task_context) {
+        auto guard = task_context.TryAcquireCallerMemory();
+        if (!guard) {
+            return ER_SDK_TIMEOUT;
+        }
+        legacy_access_started.set_value();
+        release_legacy_access_future.wait();
+        return ER_OK;
+    });
+
+    auto result = std::async(std::launch::async, [&] {
+        return wrapper.RunWithTimeoutParallel(SdkWrapper::OpType::GET, std::move(tasks), root);
+    });
+    const auto legacy_access_status = legacy_access_started_future.wait_for(std::chrono::seconds(5));
+    EXPECT_EQ(std::future_status::ready, legacy_access_status);
+    const auto cancellation_watchdog = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (root.IsLive() && std::chrono::steady_clock::now() < cancellation_watchdog) {
+        std::this_thread::yield();
+    }
+    EXPECT_FALSE(root.IsLive());
+    release_legacy_access.set_value();
+    const auto result_status = result.wait_for(std::chrono::seconds(5));
+    const auto result_code = result.get();
+    wrapper.wait_task_thread_pool_->waitFinish();
+
+    EXPECT_EQ(std::future_status::ready, result_status);
+    // The timeout still wins; both tasks finished with ER_OK before the wrapper returned.
+    EXPECT_EQ(ER_SDK_TIMEOUT_BUFFER_SAFE, result_code);
+}
+
+TEST(SdkWrapperOutcomeTest, DestroyedCommitGuardCannotPreservePeerCommitAtDeadline) {
+    SdkWrapper wrapper;
+    wrapper.wait_task_thread_pool_ = MakeStartedPool();
+    const SdkCallContext root(std::chrono::steady_clock::now() + std::chrono::seconds(2));
+    std::promise<void> both_guards_released;
+    auto both_guards_released_future = both_guards_released.get_future();
+    std::promise<void> allow_callable_return;
+    auto allow_callable_return_future = allow_callable_return.get_future().share();
+    std::atomic<int> released_count{0};
+
+    std::vector<std::function<ClientErrorCode(const SdkCallContext &)>> tasks;
+    for (int index = 0; index < 2; ++index) {
+        tasks.push_back([&, index](const SdkCallContext &task_context) {
+            {
+                auto guard = task_context.TryAcquireCallerMemory(SdkCallContext::AccessKind::OUTPUT_COMMIT);
+                if (!guard) {
+                    return ER_SDK_TIMEOUT;
+                }
+                if (index == 0) {
+                    guard->Complete(ER_OK);
+                }
+            }
+            if (released_count.fetch_add(1) + 1 == 2) {
+                both_guards_released.set_value();
+            }
+            allow_callable_return_future.wait();
+            return ER_OK;
+        });
+    }
+
+    auto result = std::async(std::launch::async, [&] {
+        return wrapper.RunWithTimeoutParallel(SdkWrapper::OpType::GET, std::move(tasks), root);
+    });
+    const auto guards_released_status = both_guards_released_future.wait_for(std::chrono::seconds(5));
+    EXPECT_EQ(std::future_status::ready, guards_released_status);
+    const auto result_status = result.wait_for(std::chrono::seconds(5));
+    EXPECT_EQ(std::future_status::ready, result_status);
+    allow_callable_return.set_value();
+    const auto result_code = result.get();
+    wrapper.wait_task_thread_pool_->waitFinish();
+
+    EXPECT_EQ(ER_SDK_TIMEOUT, result_code);
+}
+
+class WaitForFirstTaskStartPool : public LockFreeThreadPool {
+public:
+    explicit WaitForFirstTaskStartPool(std::shared_future<void> first_started)
+        : LockFreeThreadPool(1, 1, "WaitForFirstTaskStartPool"), first_started_(std::move(first_started)) {}
+
+protected:
+    SubmissionStatus TryPush(std::function<void()> &&task) override {
+        const auto status = LockFreeThreadPool::TryPush(std::move(task));
+        if (calls_++ == 0 && status == SubmissionStatus::ACCEPTED) {
+            first_started_.wait();
+        }
+        return status;
+    }
+
+private:
+    std::shared_future<void> first_started_;
+    int calls_ = 0;
+};
+
+TEST(SdkWrapperOutcomeTest, SubmissionRejectionStillReturnsAcceptedPeerTimeout) {
+    SdkWrapper wrapper;
+    const SdkCallContext root(std::chrono::steady_clock::now() + std::chrono::seconds(2));
+    std::promise<void> first_started;
+    auto first_started_future = first_started.get_future().share();
+    auto pool = std::make_unique<WaitForFirstTaskStartPool>(first_started_future);
+    ASSERT_TRUE(pool->start());
+    wrapper.wait_task_thread_pool_ = std::move(pool);
+    std::promise<void> release_first;
+    auto release_first_future = release_first.get_future().share();
+
+    std::vector<std::function<ClientErrorCode(const SdkCallContext &)>> tasks;
+    tasks.push_back([&](const SdkCallContext &) {
+        first_started.set_value();
+        release_first_future.wait();
+        return ER_SDK_TIMEOUT;
+    });
+    tasks.push_back([](const SdkCallContext &) { return ER_OK; });
+    tasks.push_back([](const SdkCallContext &) { return ER_OK; });
+
+    auto result = std::async(std::launch::async, [&] {
+        return wrapper.RunWithTimeoutParallel(SdkWrapper::OpType::GET, std::move(tasks), root);
+    });
+    const auto first_started_status = first_started_future.wait_for(std::chrono::seconds(1));
+    EXPECT_EQ(std::future_status::ready, first_started_status);
+    release_first.set_value();
+    const auto result_code = result.get();
+    wrapper.wait_task_thread_pool_->waitFinish();
+
+    EXPECT_EQ(ER_SDK_TIMEOUT, result_code);
+}
+
+enum class SubmissionThrowMode {
+    STANDARD,
+    UNKNOWN,
+};
+
+class ThrowOnSecondSubmissionPool : public LockFreeThreadPool {
+public:
+    ThrowOnSecondSubmissionPool(SubmissionThrowMode mode, std::shared_future<void> first_finished)
+        : LockFreeThreadPool(1, 4, "ThrowOnSecondSubmissionPool")
+        , mode_(mode)
+        , first_finished_(std::move(first_finished)) {}
+
+protected:
+    SubmissionStatus TryPush(std::function<void()> &&task) override {
+        if (calls_++ == 1) {
+            first_finished_.wait();
+            if (mode_ == SubmissionThrowMode::STANDARD) {
+                throw std::runtime_error("injected submission failure");
+            }
+            throw 7;
+        }
+        return LockFreeThreadPool::TryPush(std::move(task));
+    }
+
+private:
+    SubmissionThrowMode mode_;
+    std::shared_future<void> first_finished_;
+    int calls_ = 0;
+};
+
+class SubmissionExceptionPrecedenceTest : public ::testing::TestWithParam<SubmissionThrowMode> {};
+
+TEST_P(SubmissionExceptionPrecedenceTest, AcceptedPeerTimeoutBeatsSubmissionException) {
+    std::promise<void> first_finished;
+    auto first_finished_future = first_finished.get_future().share();
+    SdkWrapper wrapper;
+    auto pool = std::make_unique<ThrowOnSecondSubmissionPool>(GetParam(), first_finished_future);
+    ASSERT_TRUE(pool->start());
+    wrapper.wait_task_thread_pool_ = std::move(pool);
+    const SdkCallContext root(std::chrono::steady_clock::now() + std::chrono::seconds(2));
+
+    std::vector<std::function<ClientErrorCode(const SdkCallContext &)>> tasks;
+    tasks.push_back([&](const SdkCallContext &) {
+        first_finished.set_value();
+        return ER_SDK_TIMEOUT;
+    });
+    tasks.push_back([](const SdkCallContext &) { return ER_OK; });
+
+    EXPECT_EQ(ER_SDK_TIMEOUT, wrapper.RunWithTimeoutParallel(SdkWrapper::OpType::GET, std::move(tasks), root));
+}
+
+INSTANTIATE_TEST_SUITE_P(StandardAndUnknown,
+                         SubmissionExceptionPrecedenceTest,
+                         ::testing::Values(SubmissionThrowMode::STANDARD, SubmissionThrowMode::UNKNOWN));
+
+} // namespace
+
+namespace {
+
+ClientErrorCode
+RunParallelForTest(SdkWrapper &wrapper, std::vector<SdkWrapper::ParallelTask> tasks, std::chrono::milliseconds budget) {
+    const SdkCallContext root(std::chrono::steady_clock::now() + budget);
+    const auto result = wrapper.RunWithTimeoutParallel(SdkWrapper::OpType::GET, std::move(tasks), root);
+    wrapper.wait_task_thread_pool_->waitFinish();
+    return result;
+}
+
+} // namespace
+
+// Upstream buffer-safe contract: SAFE only when every task provably stopped
+// touching caller buffers. Guarded tasks qualify after the drain; unguarded
+// tasks only with OK, cancellation, or an explicit SAFE outcome.
+TEST(SdkWrapperBufferSafetyTest, UnguardedPlainErrorIsNotReportedBufferSafe) {
+    SdkWrapper wrapper;
+    wrapper.wait_task_thread_pool_ = MakeStartedPool();
+    std::vector<SdkWrapper::ParallelTask> tasks;
+    tasks.push_back({[](const SdkCallContext &) { return ER_SDKREAD_ERROR; }, false});
+    EXPECT_EQ(ER_SDKREAD_ERROR, RunParallelForTest(wrapper, std::move(tasks), std::chrono::seconds(2)));
+}
+
+TEST(SdkWrapperBufferSafetyTest, UnguardedExplicitSafeErrorIsReportedBufferSafe) {
+    SdkWrapper wrapper;
+    wrapper.wait_task_thread_pool_ = MakeStartedPool();
+    std::vector<SdkWrapper::ParallelTask> tasks;
+    tasks.push_back({[](const SdkCallContext &) { return ER_SDK_ERROR_BUFFER_SAFE; }, false});
+    tasks.push_back({[](const SdkCallContext &) { return ER_OK; }, false});
+    EXPECT_EQ(ER_SDK_ERROR_BUFFER_SAFE, RunParallelForTest(wrapper, std::move(tasks), std::chrono::seconds(2)));
+}
+
+TEST(SdkWrapperBufferSafetyTest, SafeFirstErrorCannotHideUnguardedPeerFailure) {
+    SdkWrapper wrapper;
+    wrapper.wait_task_thread_pool_ = MakeStartedPool(1, 8);
+    std::vector<SdkWrapper::ParallelTask> tasks;
+    tasks.push_back({[](const SdkCallContext &) { return ER_SDK_ERROR_BUFFER_SAFE; }, false});
+    tasks.push_back({[](const SdkCallContext &) { return ER_SDKREAD_ERROR; }, false});
+    const auto result = RunParallelForTest(wrapper, std::move(tasks), std::chrono::seconds(2));
+    EXPECT_NE(ER_SDK_ERROR_BUFFER_SAFE, result);
+    EXPECT_NE(ER_SDK_TIMEOUT_BUFFER_SAFE, result);
+}
+
+TEST(SdkWrapperBufferSafetyTest, GuardedPlainErrorIsReportedBufferSafe) {
+    SdkWrapper wrapper;
+    wrapper.wait_task_thread_pool_ = MakeStartedPool();
+    std::vector<SdkWrapper::ParallelTask> tasks;
+    tasks.push_back({[](const SdkCallContext &) { return ER_SDKREAD_ERROR; }, true});
+    EXPECT_EQ(ER_SDK_ERROR_BUFFER_SAFE, RunParallelForTest(wrapper, std::move(tasks), std::chrono::seconds(2)));
+}
+
+TEST(SdkWrapperBufferSafetyTest, UnfinishedUnguardedPeerKeepsPlainTimeout) {
+    SdkWrapper wrapper;
+    wrapper.wait_task_thread_pool_ = MakeStartedPool();
+    std::promise<void> release;
+    auto release_future = release.get_future().share();
+    std::vector<SdkWrapper::ParallelTask> tasks;
+    tasks.push_back({[](const SdkCallContext &) { return ER_OK; }, true});
+    tasks.push_back({[release_future](const SdkCallContext &) {
+                         release_future.wait();
+                         return ER_OK;
+                     },
+                     false});
+    const SdkCallContext root(std::chrono::steady_clock::now() + std::chrono::milliseconds(100));
+    const auto result = wrapper.RunWithTimeoutParallel(SdkWrapper::OpType::GET, std::move(tasks), root);
+    release.set_value();
+    wrapper.wait_task_thread_pool_->waitFinish();
+    EXPECT_EQ(ER_SDK_TIMEOUT, result);
+}
+
+TEST(SdkWrapperBufferSafetyTest, UnfinishedGuardedPeerIsBufferSafeAfterDrain) {
+    SdkWrapper wrapper;
+    wrapper.wait_task_thread_pool_ = MakeStartedPool();
+    std::promise<void> release;
+    auto release_future = release.get_future().share();
+    std::vector<SdkWrapper::ParallelTask> tasks;
+    // Blocked in "I/O" without a caller-memory guard, like a Valkey request waiting on the network.
+    tasks.push_back({[release_future](const SdkCallContext &) {
+                         release_future.wait();
+                         return ER_OK;
+                     },
+                     true});
+    const SdkCallContext root(std::chrono::steady_clock::now() + std::chrono::milliseconds(100));
+    const auto result = wrapper.RunWithTimeoutParallel(SdkWrapper::OpType::GET, std::move(tasks), root);
+    release.set_value();
+    wrapper.wait_task_thread_pool_->waitFinish();
+    EXPECT_EQ(ER_SDK_TIMEOUT_BUFFER_SAFE, result);
+}
+
+TEST_F(SdkWrapperTest, JsonConfigInitializesValkeyThroughFactoryWithoutNetwork) {
+    auto client_config = std::make_unique<ClientConfig>();
+    ASSERT_TRUE(client_config->FromJsonString(R"({
+        "instance_group": "group",
+        "instance_id": "instance",
+        "address": ["127.0.0.1:8080"],
+        "block_size": 128,
+        "sdk_config": {
+            "thread_num": 1,
+            "queue_size": 4,
+            "sdk_backend_configs": [{"type": "valkey"}],
+            "timeout_config": {"put_timeout_ms": 2000, "get_timeout_ms": 2000}
+        },
+        "model_deployment": {
+            "model_name": "test_model", "dtype": "FP8", "use_mla": false,
+            "tp_size": 1, "dp_size": 1, "pp_size": 1
+        },
+        "location_spec_infos": {"tp0": 1024}
+    })"));
+    InitParams params = init_params_;
+    params.storage_configs = R"([{
+        "type": "valkey",
+        "global_unique_name": "valkey-primary",
+        "storage_spec": {"endpoint": "valkey://cache.internal:6379/?db=1"}
+    }])";
+    auto ctrl = std::make_shared<FakeSdkControl>();
+    SdkWrapper wrapper;
+    ClientErrorCode init_ec = ER_OK;
+    auto factory = InitWrapperWithFake(wrapper, ctrl, client_config, params, init_ec);
+
+    ASSERT_EQ(ER_OK, init_ec);
+    ASSERT_EQ(1u, wrapper.sdk_map_.size());
+    EXPECT_NE(nullptr, wrapper.sdk_map_.at("valkey-primary"));
+    const auto cloned_config = wrapper.wrapper_config_->GetSdkBackendConfig(DataStorageType::DATA_STORAGE_TYPE_VALKEY);
+    ASSERT_NE(nullptr, cloned_config);
+    EXPECT_EQ(typeid(SdkBackendConfig), typeid(*cloned_config));
+}
+
+namespace {
+
+class PausingLegacySdk : public SdkInterface {
+public:
+    PausingLegacySdk(std::promise<void> &started, std::shared_future<void> release)
+        : started_(started), release_(std::move(release)) {}
+
+    ClientErrorCode Init(const std::shared_ptr<SdkBackendConfig> &, const std::shared_ptr<StorageConfig> &) override {
+        return ER_OK;
+    }
+    SdkType Type() override { return SdkType::LOCAL_FILE; }
+    ClientErrorCode Get(const std::vector<DataStorageUri> &, const BlockBuffers &) override {
+        started_.set_value();
+        release_.wait();
+        return ER_OK;
+    }
+    ClientErrorCode Put(const std::vector<DataStorageUri> &,
+                        const BlockBuffers &,
+                        std::shared_ptr<std::vector<DataStorageUri>>) override {
+        return ER_OK;
+    }
+
+protected:
+    ClientErrorCode Alloc(const std::vector<DataStorageUri> &, std::vector<DataStorageUri> &) override { return ER_OK; }
+
+private:
+    std::promise<void> &started_;
+    std::shared_future<void> release_;
+};
+
+TEST_F(SdkWrapperTest, ContextualCommitCannotPreserveLateLegacyGroup) {
+    init_params_.storage_configs = R"([
+        {"type":"file","global_unique_name":"contextual","storage_spec":{"root_path":"/a/","key_count_per_file":2}},
+        {"type":"file","global_unique_name":"legacy","storage_spec":{"root_path":"/b/","key_count_per_file":2}}
+    ])";
+    auto client_config = MakeClientConfigWithTimeouts(2000, 80, 8, 2);
+    auto contextual_control = std::make_shared<FakeSdkControl>();
+    contextual_control->use_context_output_commit.store(true);
+    std::promise<void> legacy_started;
+    auto legacy_started_future = legacy_started.get_future();
+    std::promise<void> release_legacy;
+    auto release_legacy_future = release_legacy.get_future().share();
+    auto factory = std::make_unique<FakeSdkFactory>(contextual_control);
+    factory->SetSdkForStorage("legacy", std::make_shared<PausingLegacySdk>(legacy_started, release_legacy_future));
+    SdkWrapper wrapper;
+    wrapper.sdk_factory_ = factory.get();
+    ASSERT_EQ(ER_OK, wrapper.Init(client_config, init_params_));
+
+    const std::vector<DataStorageUri> uris{
+        DataStorageUri("file://contextual/a?blkid=0&size=0"),
+        DataStorageUri("file://legacy/b?blkid=0&size=0"),
+    };
+    auto result = std::async(std::launch::async, [&] { return wrapper.Get(uris, {BlockBuffer(), BlockBuffer()}); });
+    const auto legacy_started_status = legacy_started_future.wait_for(std::chrono::seconds(1));
+    EXPECT_EQ(std::future_status::ready, legacy_started_status);
+    const auto result_status = result.wait_for(std::chrono::seconds(1));
+    EXPECT_EQ(std::future_status::ready, result_status);
+    release_legacy.set_value();
+    const auto result_code = result.get();
+    wrapper.wait_task_thread_pool_->waitFinish();
+
+    EXPECT_EQ(ER_SDK_TIMEOUT, result_code);
+    EXPECT_TRUE(contextual_control->output_access_succeeded.load());
+}
+
+} // namespace
