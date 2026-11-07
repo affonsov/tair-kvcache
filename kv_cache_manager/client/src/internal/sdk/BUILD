@@ -60,7 +60,11 @@ cc_library(
         "//kv_cache_manager/common:redis_client",
         "//kv_cache_manager/data_storage:common_define",
         "//kv_cache_manager/data_storage:valkey_uri_util",
-    ],
+    ] + select({
+        ":using_cuda": ["@local_config_cuda//cuda"],
+        ":using_musa": ["@local_config_musa//:musa"],
+        "//conditions:default": [],
+    }),
 )
 
 cc_library(

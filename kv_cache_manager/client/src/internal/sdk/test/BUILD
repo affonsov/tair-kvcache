@@ -37,6 +37,28 @@ cc_test(
 )
 
 cc_test(
+    name = "ValkeySdkGpuTest",
+    srcs = ["valkey_sdk_gpu_test.cc"],
+    copts = ["-fno-access-control"],
+    target_compatible_with = select({
+        ":using_cuda": [],
+        ":using_musa": [],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
+    deps = [
+        "//kv_cache_manager/client/src/internal/config",
+        "//kv_cache_manager/client/src/internal/sdk",
+        "//kv_cache_manager/client/src/internal/sdk:lock_free_thread_pool",
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/data_storage:valkey_uri_util",
+    ] + select({
+        ":using_cuda": ["@local_config_cuda//cuda"],
+        ":using_musa": ["@local_config_musa//:musa"],
+        "//conditions:default": [],
+    }),
+)
+
+cc_test(
     name = "valkey_sdk_real_service_test",
     srcs = ["valkey_sdk_real_service_test.cc"],
     tags = [

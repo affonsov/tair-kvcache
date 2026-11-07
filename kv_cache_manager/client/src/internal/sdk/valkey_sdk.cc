@@ -5,13 +5,173 @@
 #include <cstring>
 #include <limits>
 #include <new>
+#include <optional>
 #include <stdexcept>
 #include <utility>
 
+#if defined(USING_CUDA) && defined(USING_MUSA)
+#error "ValkeySdk cannot enable CUDA and MUSA simultaneously"
+#endif
+
+#if defined(USING_CUDA)
+#include "kv_cache_manager/client/src/internal/sdk/cuda_util.h"
+#elif defined(USING_MUSA)
+#include "kv_cache_manager/client/src/internal/sdk/musa_util.h"
+#endif
 #include "kv_cache_manager/common/logger.h"
 #include "kv_cache_manager/data_storage/valkey_uri_util.h"
 
 namespace kv_cache_manager {
+namespace {
+
+constexpr std::size_t kMaximumSliceBlocks = 64;
+constexpr std::size_t kMaximumSlicePayloadBytes = 1024 * 1024;
+
+std::size_t SliceEnd(const std::vector<std::size_t> &expected_sizes, std::size_t begin) {
+    std::size_t end = begin;
+    std::size_t payload_bytes = 0;
+    while (end < expected_sizes.size() && end - begin < kMaximumSliceBlocks) {
+        const std::size_t block_bytes = expected_sizes[end];
+        if (end != begin && block_bytes > kMaximumSlicePayloadBytes - payload_bytes) {
+            break;
+        }
+        ++end;
+        if (block_bytes > kMaximumSlicePayloadBytes) {
+            break;
+        }
+        payload_bytes += block_bytes;
+    }
+    return end;
+}
+
+bool IsSupportedMemoryType(MemoryType type) {
+    if (type == MemoryType::CPU) {
+        return true;
+    }
+#if defined(USING_CUDA) || defined(USING_MUSA)
+    return type == MemoryType::GPU;
+#else
+    return false;
+#endif
+}
+
+#if defined(USING_CUDA)
+using GpuError = cudaError_t;
+using GpuMemcpyKind = cudaMemcpyKind;
+using GpuPointerAttributes = cudaPointerAttributes;
+constexpr GpuError kGpuSuccess = cudaSuccess;
+constexpr GpuMemcpyKind kDeviceToHost = cudaMemcpyDeviceToHost;
+constexpr GpuMemcpyKind kHostToDevice = cudaMemcpyHostToDevice;
+
+const char *GpuErrorString(GpuError error) { return cudaGetErrorString(error); }
+GpuError GpuPointerGetAttributes(GpuPointerAttributes *attributes, const void *pointer) {
+    return cudaPointerGetAttributes(attributes, pointer);
+}
+GpuError GpuGetDevice(int *device) { return cudaGetDevice(device); }
+GpuError GpuSetDevice(int device) { return cudaSetDevice(device); }
+GpuError GpuMemcpy(void *destination, const void *source, std::size_t size, GpuMemcpyKind kind) {
+    return cudaMemcpy(destination, source, size, kind);
+}
+#elif defined(USING_MUSA)
+using GpuError = musaError_t;
+using GpuMemcpyKind = musaMemcpyKind;
+using GpuPointerAttributes = musaPointerAttributes;
+constexpr GpuError kGpuSuccess = musaSuccess;
+constexpr GpuMemcpyKind kDeviceToHost = musaMemcpyDeviceToHost;
+constexpr GpuMemcpyKind kHostToDevice = musaMemcpyHostToDevice;
+
+const char *GpuErrorString(GpuError error) { return musaGetErrorString(error); }
+GpuError GpuPointerGetAttributes(GpuPointerAttributes *attributes, const void *pointer) {
+    return musaPointerGetAttributes(attributes, pointer);
+}
+GpuError GpuGetDevice(int *device) { return musaGetDevice(device); }
+GpuError GpuSetDevice(int device) { return musaSetDevice(device); }
+GpuError GpuMemcpy(void *destination, const void *source, std::size_t size, GpuMemcpyKind kind) {
+    return musaMemcpy(destination, source, size, kind);
+}
+#endif
+
+#if defined(USING_CUDA) || defined(USING_MUSA)
+void LogGpuError(const char *operation, const char *api, GpuError error) {
+    KVCM_LOG_WARN("Valkey %s %s failed: error [%d] [%s]", operation, api, error, GpuErrorString(error));
+}
+
+ClientErrorCode CopyGpuOnOwningDevice(void *destination,
+                                      const void *source,
+                                      const void *device_pointer,
+                                      std::size_t size,
+                                      GpuMemcpyKind kind,
+                                      const char *operation) {
+    GpuPointerAttributes attributes{};
+    GpuError operation_error = GpuPointerGetAttributes(&attributes, device_pointer);
+    if (operation_error != kGpuSuccess) {
+        LogGpuError(operation, "pointer attribute query", operation_error);
+        return ER_CUDAMEMCPY_ERROR;
+    }
+    if (attributes.device < 0) {
+        KVCM_LOG_WARN("Valkey %s pointer attribute query returned invalid device metadata", operation);
+        return ER_CUDAMEMCPY_ERROR;
+    }
+
+    int original_device = -1;
+    operation_error = GpuGetDevice(&original_device);
+    if (operation_error != kGpuSuccess) {
+        LogGpuError(operation, "get current device", operation_error);
+        return ER_CUDAMEMCPY_ERROR;
+    }
+
+    const bool device_switch_required = original_device != attributes.device;
+    if (device_switch_required) {
+        operation_error = GpuSetDevice(attributes.device);
+        if (operation_error != kGpuSuccess) {
+            LogGpuError(operation, "set owning device", operation_error);
+        }
+    }
+    if (operation_error == kGpuSuccess) {
+        operation_error = GpuMemcpy(destination, source, size, kind);
+        if (operation_error != kGpuSuccess) {
+            LogGpuError(operation, "synchronous copy", operation_error);
+        }
+    }
+
+    GpuError restore_error = kGpuSuccess;
+    if (device_switch_required) {
+        restore_error = GpuSetDevice(original_device);
+        if (restore_error != kGpuSuccess) {
+            LogGpuError(operation, "restore current device", restore_error);
+        }
+    }
+    return operation_error == kGpuSuccess && restore_error == kGpuSuccess ? ER_OK : ER_CUDAMEMCPY_ERROR;
+}
+#endif
+
+ClientErrorCode CopyFromCaller(char *destination, const Iov &iov, std::size_t source_offset, std::size_t size) {
+    if (iov.type == MemoryType::CPU) {
+        std::memcpy(destination, static_cast<const char *>(iov.base) + source_offset, size);
+        return ER_OK;
+    }
+#if defined(USING_CUDA) || defined(USING_MUSA)
+    const auto source_address = reinterpret_cast<std::uintptr_t>(iov.base) + source_offset;
+    const void *source = reinterpret_cast<const void *>(source_address);
+    return CopyGpuOnOwningDevice(destination, source, source, size, kDeviceToHost, "Put device-to-host copy");
+#else
+    return ER_UNSUPPORTED_MEMORY_TYPE;
+#endif
+}
+
+ClientErrorCode CopyToCaller(const Iov &iov, const char *source) {
+    if (iov.type == MemoryType::CPU) {
+        std::memcpy(iov.base, source, iov.size);
+        return ER_OK;
+    }
+#if defined(USING_CUDA) || defined(USING_MUSA)
+    return CopyGpuOnOwningDevice(iov.base, source, iov.base, iov.size, kHostToDevice, "Get host-to-device copy");
+#else
+    return ER_UNSUPPORTED_MEMORY_TYPE;
+#endif
+}
+
+} // namespace
 
 ClientErrorCode ValkeySdk::Init(const std::shared_ptr<SdkBackendConfig> &sdk_backend_config,
                                 const std::shared_ptr<StorageConfig> &storage_config) {
@@ -105,56 +265,85 @@ ClientErrorCode ValkeySdk::GetWithContext(const std::vector<DataStorageUri> &rem
         return ER_SDK_TIMEOUT;
     }
 
-    ValkeyGetStringsResult result;
-    try {
-        result = GetStringsUntil(*client, redis_keys, expected_sizes, context.deadline());
-    } catch (const std::bad_alloc &) {
-        return context.IsLive() ? ER_INVALID_LOCAL_BUFFERS : ER_SDK_TIMEOUT;
-    } catch (const std::length_error &) {
-        return context.IsLive() ? ER_INVALID_LOCAL_BUFFERS : ER_SDK_TIMEOUT;
-    } catch (...) {
-        return context.IsLive() ? ER_SDKREAD_ERROR : ER_SDK_TIMEOUT;
-    }
-
-    if (!context.IsLive() || result.operation_error == EC_TIMEOUT ||
-        std::find(result.errors.begin(), result.errors.end(), EC_TIMEOUT) != result.errors.end()) {
-        return ER_SDK_TIMEOUT;
-    }
-    if (result.operation_error != EC_OK || result.errors.size() != remote_uris.size() ||
-        result.values.size() != remote_uris.size()) {
-        return ER_SDKREAD_ERROR;
-    }
-
+    std::optional<SdkCallContext::CallerMemoryGuard> output_access;
     bool has_error = false;
-    for (std::size_t block_index = 0; block_index < result.errors.size(); ++block_index) {
-        if (result.errors[block_index] != EC_OK || result.values[block_index].size() != expected_sizes[block_index]) {
-            has_error = true;
+    auto finish = [&output_access](ClientErrorCode result) {
+        if (output_access) {
+            output_access->Complete(result);
         }
-    }
+        return result;
+    };
 
-    auto access = context.TryAcquireCallerMemory(SdkCallContext::AccessKind::OUTPUT_COMMIT);
-    if (!access) {
-        return ER_SDK_TIMEOUT;
-    }
-    OnOutputCommitAdmitted();
-    for (std::size_t block_index = 0; block_index < result.errors.size(); ++block_index) {
-        if (result.errors[block_index] != EC_OK || result.values[block_index].size() != expected_sizes[block_index]) {
-            continue;
+    for (std::size_t begin = 0; begin < remote_uris.size();) {
+        if (!context.IsLive()) {
+            return finish(ER_SDK_TIMEOUT);
         }
-        std::size_t offset = 0;
-        for (const auto &iov : local_buffers[block_index].iovs) {
-            if (iov.size == 0) {
+        const std::size_t end = SliceEnd(expected_sizes, begin);
+        ValkeyGetStringsResult result;
+        try {
+            const std::vector<std::string> slice_keys(redis_keys.begin() + begin, redis_keys.begin() + end);
+            const std::vector<std::size_t> slice_sizes(expected_sizes.begin() + begin, expected_sizes.begin() + end);
+            result = GetStringsUntil(*client, slice_keys, slice_sizes, context.deadline());
+        } catch (const std::bad_alloc &) {
+            return finish(context.IsLive() ? ER_INVALID_LOCAL_BUFFERS : ER_SDK_TIMEOUT);
+        } catch (const std::length_error &) {
+            return finish(context.IsLive() ? ER_INVALID_LOCAL_BUFFERS : ER_SDK_TIMEOUT);
+        } catch (...) {
+            return finish(context.IsLive() ? ER_SDKREAD_ERROR : ER_SDK_TIMEOUT);
+        }
+
+        const std::size_t slice_blocks = end - begin;
+        if (!context.IsLive() || result.operation_error == EC_TIMEOUT ||
+            std::find(result.errors.begin(), result.errors.end(), EC_TIMEOUT) != result.errors.end()) {
+            return finish(ER_SDK_TIMEOUT);
+        }
+        if (result.operation_error != EC_OK || result.errors.size() != slice_blocks ||
+            result.values.size() != slice_blocks) {
+            return finish(ER_SDKREAD_ERROR);
+        }
+
+        bool slice_has_scatter = false;
+        for (std::size_t index = 0; index < slice_blocks; ++index) {
+            if (result.errors[index] != EC_OK || result.values[index].size() != expected_sizes[begin + index]) {
+                has_error = true;
                 continue;
             }
-            if (!iov.ignore) {
-                std::memcpy(iov.base, result.values[block_index].data() + offset, iov.size);
+            for (const auto &iov : local_buffers[begin + index].iovs) {
+                if (!iov.ignore && iov.size != 0) {
+                    slice_has_scatter = true;
+                    break;
+                }
             }
-            offset += iov.size;
         }
+
+        if (slice_has_scatter && !output_access) {
+            output_access = context.TryAcquireCallerMemory(SdkCallContext::AccessKind::OUTPUT_COMMIT);
+            if (!output_access) {
+                return ER_SDK_TIMEOUT;
+            }
+        }
+
+        if (slice_has_scatter) {
+            for (std::size_t index = 0; index < slice_blocks; ++index) {
+                if (result.errors[index] != EC_OK || result.values[index].size() != expected_sizes[begin + index]) {
+                    continue;
+                }
+                std::size_t source_offset = 0;
+                for (const auto &iov : local_buffers[begin + index].iovs) {
+                    if (!iov.ignore && iov.size != 0) {
+                        ec = CopyToCaller(iov, result.values[index].data() + source_offset);
+                        if (ec != ER_OK) {
+                            return finish(ec);
+                        }
+                    }
+                    source_offset += iov.size;
+                }
+            }
+        }
+        begin = end;
     }
-    const ClientErrorCode result_code = has_error ? ER_SDKREAD_ERROR : ER_OK;
-    access->Complete(result_code);
-    return result_code;
+
+    return finish(has_error ? ER_SDKREAD_ERROR : ER_OK);
 }
 
 ClientErrorCode ValkeySdk::PutWithContext(const std::vector<DataStorageUri> &remote_uris,
@@ -169,7 +358,6 @@ ClientErrorCode ValkeySdk::PutWithContext(const std::vector<DataStorageUri> &rem
         if (!access) {
             return ER_SDK_TIMEOUT;
         }
-        OnOutputCommitAdmitted();
         std::vector<DataStorageUri> empty;
         actual_remote_uris->swap(empty);
         access->Complete(ER_OK);
@@ -182,12 +370,6 @@ ClientErrorCode ValkeySdk::PutWithContext(const std::vector<DataStorageUri> &rem
     std::vector<std::string> redis_keys;
     std::vector<std::size_t> expected_sizes;
     ClientErrorCode ec = Preflight(remote_uris, local_buffers, storage_identity_, false, redis_keys, expected_sizes);
-    if (ec != ER_OK) {
-        return ec;
-    }
-
-    std::vector<std::string> values;
-    ec = Gather(local_buffers, expected_sizes, context, values);
     if (ec != ER_OK) {
         return ec;
     }
@@ -209,36 +391,56 @@ ClientErrorCode ValkeySdk::PutWithContext(const std::vector<DataStorageUri> &rem
         return ER_SDK_TIMEOUT;
     }
 
-    ValkeySetStringsResult result;
-    try {
-        result = SetStringsUntil(*client, redis_keys, values, context.deadline());
-    } catch (...) {
-        return context.IsLive() ? ER_SDKWRITE_ERROR : ER_SDK_TIMEOUT;
-    }
-
-    const bool has_timeout = result.operation_error == EC_TIMEOUT ||
-                             std::find(result.errors.begin(), result.errors.end(), EC_TIMEOUT) != result.errors.end();
-    const bool has_ambiguous =
-        std::find(result.certainties.begin(), result.certainties.end(), ValkeyWriteCertainty::AMBIGUOUS) !=
-        result.certainties.end();
-    if (!context.IsLive() || has_timeout || has_ambiguous) {
-        return ER_SDK_TIMEOUT;
-    }
-    if (result.operation_error != EC_OK || result.errors.size() != remote_uris.size() ||
-        result.certainties.size() != remote_uris.size()) {
-        return ER_SDKWRITE_ERROR;
-    }
-    for (std::size_t i = 0; i < remote_uris.size(); ++i) {
-        if (result.errors[i] != EC_OK || result.certainties[i] != ValkeyWriteCertainty::CONFIRMED) {
-            return ER_SDKWRITE_ERROR;
+    for (std::size_t begin = 0; begin < remote_uris.size();) {
+        if (!context.IsLive()) {
+            return ER_SDK_TIMEOUT;
         }
+        const std::size_t end = SliceEnd(expected_sizes, begin);
+        {
+            std::vector<std::string> values;
+            ec = Gather(local_buffers, expected_sizes, begin, end, context, values);
+            if (ec != ER_OK) {
+                return ec;
+            }
+            if (!context.IsLive()) {
+                return ER_SDK_TIMEOUT;
+            }
+
+            ValkeySetStringsResult result;
+            try {
+                const std::vector<std::string> slice_keys(redis_keys.begin() + begin, redis_keys.begin() + end);
+                result = SetStringsUntil(*client, slice_keys, values, context.deadline());
+            } catch (...) {
+                return context.IsLive() ? ER_SDKWRITE_ERROR : ER_SDK_TIMEOUT;
+            }
+
+            const bool has_timeout =
+                result.operation_error == EC_TIMEOUT ||
+                std::find(result.errors.begin(), result.errors.end(), EC_TIMEOUT) != result.errors.end();
+            const bool has_ambiguous =
+                std::find(result.certainties.begin(), result.certainties.end(), ValkeyWriteCertainty::AMBIGUOUS) !=
+                result.certainties.end();
+            if (!context.IsLive() || has_timeout || has_ambiguous) {
+                return ER_SDK_TIMEOUT;
+            }
+            const std::size_t slice_blocks = end - begin;
+            if (result.operation_error != EC_OK || result.errors.size() != slice_blocks ||
+                result.certainties.size() != slice_blocks) {
+                return ER_SDKWRITE_ERROR;
+            }
+            for (std::size_t index = 0; index < slice_blocks; ++index) {
+                if (result.errors[index] != EC_OK || result.certainties[index] != ValkeyWriteCertainty::CONFIRMED) {
+                    return ER_SDKWRITE_ERROR;
+                }
+            }
+        }
+        begin = end;
     }
 
     auto access = context.TryAcquireCallerMemory(SdkCallContext::AccessKind::OUTPUT_COMMIT);
     if (!access) {
         return ER_SDK_TIMEOUT;
     }
-    OnOutputCommitAdmitted();
     actual_remote_uris->swap(successful_remote_uris);
     access->Complete(ER_OK);
     return ER_OK;
@@ -278,10 +480,6 @@ ValkeyGetStringsResult ValkeySdk::GetStringsUntil(RedisClient &client,
     return client.GetStringsUntil(keys, expected_sizes, deadline);
 }
 
-void ValkeySdk::OnSourceChunkRead(std::size_t, std::size_t, std::size_t) {}
-
-void ValkeySdk::OnOutputCommitAdmitted() {}
-
 ClientErrorCode ValkeySdk::Preflight(const std::vector<DataStorageUri> &remote_uris,
                                      const BlockBuffers &local_buffers,
                                      const std::string &storage_identity,
@@ -309,7 +507,7 @@ ClientErrorCode ValkeySdk::Preflight(const std::vector<DataStorageUri> &remote_u
                         return ER_INVALID_PARAMS;
                     }
                 } else {
-                    if (iov.type != MemoryType::CPU) {
+                    if (!IsSupportedMemoryType(iov.type)) {
                         return ER_UNSUPPORTED_MEMORY_TYPE;
                     }
                     if (!iov.base) {
@@ -349,18 +547,17 @@ ClientErrorCode ValkeySdk::Preflight(const std::vector<DataStorageUri> &remote_u
 
 ClientErrorCode ValkeySdk::Gather(const BlockBuffers &local_buffers,
                                   const std::vector<std::size_t> &expected_sizes,
+                                  std::size_t begin,
+                                  std::size_t end,
                                   const SdkCallContext &context,
                                   std::vector<std::string> &values) {
-    constexpr std::size_t kGatherChunkSize = 64 * 1024;
-
-    // Allocate and initialize owned destinations before admitting access to
-    // caller memory. Once admitted, each cancellation interval contains at
-    // most one 64 KiB copy plus test/instrumentation hook overhead.
+    // Allocate owned host destinations before admitting caller-memory access.
+    // Each cancellation interval contains at most one synchronous 64 KiB copy.
     values.clear();
     try {
-        values.reserve(local_buffers.size());
-        for (const std::size_t expected_size : expected_sizes) {
-            values.emplace_back(expected_size, '\0');
+        values.reserve(end - begin);
+        for (std::size_t index = begin; index < end; ++index) {
+            values.emplace_back(expected_sizes[index], '\0');
         }
     } catch (const std::bad_alloc &) {
         return context.IsLive() ? ER_INVALID_LOCAL_BUFFERS : ER_SDK_TIMEOUT;
@@ -373,22 +570,20 @@ ClientErrorCode ValkeySdk::Gather(const BlockBuffers &local_buffers,
         return ER_SDK_TIMEOUT;
     }
 
-    for (std::size_t block_index = 0; block_index < local_buffers.size(); ++block_index) {
+    for (std::size_t block_index = begin; block_index < end; ++block_index) {
         std::size_t destination_offset = 0;
-        for (std::size_t iov_index = 0; iov_index < local_buffers[block_index].iovs.size(); ++iov_index) {
-            const auto &iov = local_buffers[block_index].iovs[iov_index];
-            std::size_t source_offset = 0;
-            while (source_offset < iov.size) {
-                if (!context.IsLive()) {
-                    return ER_SDK_TIMEOUT;
-                }
-                const std::size_t chunk_size = std::min(kGatherChunkSize, iov.size - source_offset);
-                std::memcpy(values[block_index].data() + destination_offset,
-                            static_cast<const char *>(iov.base) + source_offset,
-                            chunk_size);
-                source_offset += chunk_size;
-                destination_offset += chunk_size;
-                OnSourceChunkRead(block_index, iov_index, chunk_size);
+        for (const auto &iov : local_buffers[block_index].iovs) {
+            const ClientErrorCode iov_ec = valkey_sdk_internal::CopyInBoundedChunks(
+                iov.size, context, [&](std::size_t source_offset, std::size_t chunk_size) {
+                    const ClientErrorCode copy_ec = CopyFromCaller(
+                        values[block_index - begin].data() + destination_offset, iov, source_offset, chunk_size);
+                    if (copy_ec == ER_OK) {
+                        destination_offset += chunk_size;
+                    }
+                    return copy_ec;
+                });
+            if (iov_ec != ER_OK) {
+                return iov_ec;
             }
         }
     }

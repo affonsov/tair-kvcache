@@ -1,11 +1,17 @@
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <functional>
 #include <future>
+#include <iomanip>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <new>
+#include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -56,12 +62,26 @@ struct FakeRedisState {
     std::vector<ValkeyWriteCertainty> set_certainties;
     std::vector<ErrorCode> get_results;
     std::vector<std::string> get_values;
+    std::vector<ValkeySetStringsResult> scripted_set_results;
+    std::vector<ValkeyGetStringsResult> scripted_get_results;
+    std::vector<std::vector<std::string>> key_batches;
+    std::vector<std::vector<std::string>> value_batches;
+    std::vector<std::vector<std::size_t>> expected_size_batches;
+    std::vector<std::chrono::steady_clock::time_point> get_io_deadlines;
+    std::vector<std::chrono::steady_clock::time_point> set_io_deadlines;
+    std::size_t peak_set_payload_bytes = 0;
     std::vector<std::string> last_keys;
     std::vector<std::string> last_values;
     std::chrono::steady_clock::time_point acquire_get_deadline;
     std::chrono::steady_clock::time_point acquire_put_deadline;
     std::chrono::steady_clock::time_point get_io_deadline;
     std::chrono::steady_clock::time_point set_io_deadline;
+    std::mutex barrier_mutex;
+    std::condition_variable barrier_cv;
+    std::size_t blocked_get_call = std::numeric_limits<std::size_t>::max();
+    bool blocked_get_entered = false;
+    bool release_blocked_get = false;
+    std::optional<SdkCallContext> active_get_context;
 };
 
 class FakeRedisClient : public RedisClient {
@@ -78,11 +98,18 @@ public:
     explicit TestValkeySdk(std::shared_ptr<FakeRedisState> state) : state_(std::move(state)) {}
 
     void set_fail_client_creation(bool value) { fail_client_creation_ = value; }
-    void set_source_chunk_hook(std::function<void(std::size_t, std::size_t, std::size_t)> hook) {
-        source_chunk_hook_ = std::move(hook);
-    }
-    void set_output_commit_hook(std::function<void()> hook) { output_commit_hook_ = std::move(hook); }
     const std::vector<std::string> &created_endpoints() const { return created_endpoints_; }
+
+    ClientErrorCode GetWithContext(const std::vector<DataStorageUri> &remote_uris,
+                                   const BlockBuffers &local_buffers,
+                                   const SdkCallContext &context) override {
+        {
+            std::lock_guard lock(state_->barrier_mutex);
+            state_->active_get_context = context;
+        }
+        state_->barrier_cv.notify_all();
+        return ValkeySdk::GetWithContext(remote_uris, local_buffers, context);
+    }
 
 protected:
     std::shared_ptr<RedisClient> CreateClient(const StandardUri &endpoint) override {
@@ -112,8 +139,16 @@ protected:
                                            const std::vector<std::string> &keys,
                                            const std::vector<std::string> &values,
                                            Deadline deadline) override {
-        ++state_->set_calls;
+        const std::size_t call_index = state_->set_calls++;
         state_->set_io_deadline = deadline;
+        state_->set_io_deadlines.push_back(deadline);
+        state_->key_batches.push_back(keys);
+        state_->value_batches.push_back(values);
+        std::size_t payload_bytes = 0;
+        for (const auto &value : values) {
+            payload_bytes += value.size();
+        }
+        state_->peak_set_payload_bytes = std::max(state_->peak_set_payload_bytes, payload_bytes);
         if (state_->set_delay_ms > 0) {
             std::this_thread::sleep_for(std::chrono::milliseconds(state_->set_delay_ms));
         }
@@ -121,6 +156,9 @@ protected:
         state_->last_keys = keys;
         state_->last_values = values;
 
+        if (call_index < state_->scripted_set_results.size()) {
+            return state_->scripted_set_results[call_index];
+        }
         ValkeySetStringsResult result;
         result.operation_error = state_->set_operation_error;
         result.errors = state_->use_set_results ? state_->set_results : std::vector<ErrorCode>(keys.size(), EC_OK);
@@ -138,16 +176,28 @@ protected:
 
     ValkeyGetStringsResult GetStringsUntil(RedisClient &,
                                            const std::vector<std::string> &keys,
-                                           const std::vector<std::size_t> &,
+                                           const std::vector<std::size_t> &expected_sizes,
                                            Deadline deadline) override {
-        ++state_->get_calls;
+        const std::size_t call_index = state_->get_calls++;
         state_->get_io_deadline = deadline;
+        state_->get_io_deadlines.push_back(deadline);
+        state_->key_batches.push_back(keys);
+        state_->expected_size_batches.push_back(expected_sizes);
+        if (call_index == state_->blocked_get_call) {
+            std::unique_lock lock(state_->barrier_mutex);
+            state_->blocked_get_entered = true;
+            state_->barrier_cv.notify_all();
+            state_->barrier_cv.wait(lock, [&] { return state_->release_blocked_get; });
+        }
         if (state_->get_delay_ms > 0) {
             std::this_thread::sleep_for(std::chrono::milliseconds(state_->get_delay_ms));
         }
         ThrowIfConfigured(state_->get_throw_mode);
         state_->last_keys = keys;
 
+        if (call_index < state_->scripted_get_results.size()) {
+            return state_->scripted_get_results[call_index];
+        }
         ValkeyGetStringsResult result;
         result.operation_error = state_->get_operation_error;
         result.errors = state_->use_get_results ? state_->get_results : std::vector<ErrorCode>(keys.size(), EC_OK);
@@ -155,24 +205,10 @@ protected:
         return result;
     }
 
-    void OnSourceChunkRead(std::size_t block_index, std::size_t iov_index, std::size_t chunk_size) override {
-        if (source_chunk_hook_) {
-            source_chunk_hook_(block_index, iov_index, chunk_size);
-        }
-    }
-
-    void OnOutputCommitAdmitted() override {
-        if (output_commit_hook_) {
-            output_commit_hook_();
-        }
-    }
-
 private:
     std::shared_ptr<FakeRedisState> state_;
     bool fail_client_creation_ = false;
     std::vector<std::string> created_endpoints_;
-    std::function<void(std::size_t, std::size_t, std::size_t)> source_chunk_hook_;
-    std::function<void()> output_commit_hook_;
 };
 
 std::shared_ptr<SdkBackendConfig> MakeSdkConfig(int get_timeout_ms = 2000, int put_timeout_ms = 2000) {
@@ -202,6 +238,47 @@ BlockBuffer CpuBuffer(void *base, std::size_t size) {
     BlockBuffer buffer;
     buffer.iovs.push_back(Iov{MemoryType::CPU, base, size, false});
     return buffer;
+}
+
+std::string OpaqueId(std::size_t index) {
+    std::ostringstream stream;
+    stream << std::hex << std::setw(32) << std::setfill('0') << index;
+    return stream.str();
+}
+
+void MakeCpuRequest(const std::vector<std::size_t> &sizes,
+                    std::vector<std::string> &storage,
+                    std::vector<DataStorageUri> &uris,
+                    BlockBuffers &buffers) {
+    storage.clear();
+    storage.resize(sizes.size());
+    uris.clear();
+    buffers.clear();
+    uris.reserve(sizes.size());
+    buffers.reserve(sizes.size());
+    for (std::size_t index = 0; index < sizes.size(); ++index) {
+        storage[index].assign(sizes[index], static_cast<char>('a' + index % 26));
+        uris.push_back(MakeLocation("valkey-primary", OpaqueId(index + 1), sizes[index]));
+        buffers.push_back(CpuBuffer(sizes[index] == 0 ? nullptr : storage[index].data(), sizes[index]));
+    }
+}
+
+ValkeySetStringsResult SetResult(std::size_t count,
+                                 ErrorCode error = EC_OK,
+                                 ValkeyWriteCertainty certainty = ValkeyWriteCertainty::CONFIRMED) {
+    ValkeySetStringsResult result;
+    result.operation_error = EC_OK;
+    result.errors.assign(count, error);
+    result.certainties.assign(count, certainty);
+    return result;
+}
+
+ValkeyGetStringsResult GetResult(std::vector<std::string> values, ErrorCode error = EC_OK) {
+    ValkeyGetStringsResult result;
+    result.operation_error = EC_OK;
+    result.errors.assign(values.size(), error);
+    result.values = std::move(values);
+    return result;
 }
 
 class ValkeySdkTest : public TESTBASE {
@@ -319,19 +396,21 @@ TEST_F(ValkeySdkTest, InvalidRequestsAreRejectedBeforeIoOrDestinationWrites) {
         BlockBuffers buffers;
         ClientErrorCode expected;
     };
-    std::vector<InvalidCase> cases{
+    std::vector<InvalidCase> cases {
         {{malformed}, {CpuBuffer(source, sizeof(source))}, ER_INVALID_PARAMS},
-        {{cross}, {CpuBuffer(source, sizeof(source))}, ER_INVALID_PARAMS},
-        {{wrong_size}, {CpuBuffer(source, sizeof(source))}, ER_INVALID_PARAMS},
-        {{valid, valid}, {CpuBuffer(source, sizeof(source))}, ER_INVALID_PARAMS},
-        {{valid}, {CpuBuffer(nullptr, sizeof(source))}, ER_INVALID_LOCAL_BUFFERS},
-        {{valid},
-         {CpuBuffer(reinterpret_cast<void *>(std::numeric_limits<std::uintptr_t>::max() - 1), 4)},
-         ER_INVALID_ADDRESS},
-        {{valid}, {accumulated_size_overflow}, ER_INVALID_LOCAL_BUFFERS},
-        {{valid},
-         {{std::vector<Iov>{Iov{MemoryType::GPU, source, sizeof(source), false}}}},
-         ER_UNSUPPORTED_MEMORY_TYPE},
+            {{cross}, {CpuBuffer(source, sizeof(source))}, ER_INVALID_PARAMS},
+            {{wrong_size}, {CpuBuffer(source, sizeof(source))}, ER_INVALID_PARAMS},
+            {{valid, valid}, {CpuBuffer(source, sizeof(source))}, ER_INVALID_PARAMS},
+            {{valid}, {CpuBuffer(nullptr, sizeof(source))}, ER_INVALID_LOCAL_BUFFERS},
+            {{valid},
+             {CpuBuffer(reinterpret_cast<void *>(std::numeric_limits<std::uintptr_t>::max() - 1), 4)},
+             ER_INVALID_ADDRESS},
+            {{valid}, {accumulated_size_overflow}, ER_INVALID_LOCAL_BUFFERS},
+#if !defined(USING_CUDA) && !defined(USING_MUSA)
+            {{valid},
+             {{std::vector<Iov>{Iov{MemoryType::GPU, source, sizeof(source), false}}}},
+             ER_UNSUPPORTED_MEMORY_TYPE},
+#endif
     };
 
     for (const auto &test_case : cases) {
@@ -676,6 +755,192 @@ TEST_F(ValkeySdkTest, AmbiguousPutMapsToTimeoutAndPreservesOutput) {
     EXPECT_EQ(sentinel.ToUriString(), actual->at(0).ToUriString());
 }
 
+TEST_F(ValkeySdkTest, GetWithOnlyIgnoredOrZeroLengthIovsDoesNotAdmitOutputCommit) {
+    char ignored[2] = {'q', 'q'};
+    BlockBuffer buffer;
+    buffer.iovs = {
+        Iov{MemoryType::GPU, ignored, sizeof(ignored), true},
+        Iov{MemoryType::GPU, nullptr, 0, false},
+    };
+    const std::vector<DataStorageUri> uris{
+        MakeLocation("valkey-primary", "00000000000000000000000000000020", sizeof(ignored)),
+    };
+    state_->get_values = {"ok"};
+    const SdkCallContext context(std::chrono::steady_clock::now() + std::chrono::seconds(5));
+
+    EXPECT_EQ(ER_OK, sdk_->GetWithContext(uris, {buffer}, context));
+    EXPECT_EQ("qq", std::string(ignored, sizeof(ignored)));
+    EXPECT_FALSE(context.HasAdmittedOutputCommit());
+    EXPECT_FALSE(context.CompletedOutputCommit().has_value());
+}
+
+TEST_F(ValkeySdkTest, PutSlicesAtBlockAndPayloadLimitsAndBoundsStagedBytes) {
+    constexpr std::size_t kMiB = 1024 * 1024;
+    std::vector<std::size_t> sizes(64, 0);
+    sizes.push_back(kMiB);
+    sizes.push_back(1);
+    std::vector<std::string> storage;
+    std::vector<DataStorageUri> uris;
+    BlockBuffers buffers;
+    MakeCpuRequest(sizes, storage, uris, buffers);
+    auto actual = std::make_shared<std::vector<DataStorageUri>>();
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    const SdkCallContext context(deadline);
+
+    ASSERT_EQ(ER_OK, sdk_->PutWithContext(uris, buffers, actual, context));
+    ASSERT_EQ(3u, state_->value_batches.size());
+    EXPECT_EQ(64u, state_->value_batches[0].size());
+    EXPECT_EQ(1u, state_->value_batches[1].size());
+    EXPECT_EQ(1u, state_->value_batches[2].size());
+    EXPECT_EQ(kMiB, state_->value_batches[1][0].size());
+    EXPECT_EQ(kMiB, state_->peak_set_payload_bytes);
+    EXPECT_EQ(uris.size(), actual->size());
+    ASSERT_EQ(3u, state_->set_io_deadlines.size());
+    for (const auto observed_deadline : state_->set_io_deadlines) {
+        EXPECT_EQ(deadline, observed_deadline);
+    }
+}
+
+TEST_F(ValkeySdkTest, OversizedPutBlockRunsAloneAndPreservesOrdering) {
+    constexpr std::size_t kMiB = 1024 * 1024;
+    const std::vector<std::size_t> sizes{1, kMiB + 1, 1};
+    std::vector<std::string> storage;
+    std::vector<DataStorageUri> uris;
+    BlockBuffers buffers;
+    MakeCpuRequest(sizes, storage, uris, buffers);
+    auto actual = std::make_shared<std::vector<DataStorageUri>>();
+
+    ASSERT_EQ(ER_OK, sdk_->Put(uris, buffers, actual));
+    ASSERT_EQ(3u, state_->value_batches.size());
+    for (std::size_t index = 0; index < sizes.size(); ++index) {
+        ASSERT_EQ(1u, state_->value_batches[index].size());
+        EXPECT_EQ(storage[index], state_->value_batches[index][0]);
+        ASSERT_EQ(1u, state_->key_batches[index].size());
+        EXPECT_EQ("kvcm:valkey:14:valkey-primary:" + OpaqueId(index + 1), state_->key_batches[index][0]);
+        EXPECT_EQ(uris[index].ToUriString(), actual->at(index).ToUriString());
+    }
+    EXPECT_EQ(kMiB + 1, state_->peak_set_payload_bytes);
+}
+
+TEST_F(ValkeySdkTest, GetSlicesPreserveOrderingAndUnchangedDeadline) {
+    constexpr std::size_t kBlockCount = 65;
+    std::vector<std::size_t> sizes(kBlockCount, 1);
+    std::vector<std::string> destinations;
+    std::vector<DataStorageUri> uris;
+    BlockBuffers buffers;
+    MakeCpuRequest(sizes, destinations, uris, buffers);
+    for (auto &destination : destinations) {
+        destination[0] = 'x';
+    }
+    std::vector<std::string> first_values;
+    first_values.reserve(64);
+    for (std::size_t index = 0; index < 64; ++index) {
+        first_values.emplace_back(1, static_cast<char>('A' + index % 26));
+    }
+    state_->scripted_get_results = {GetResult(first_values), GetResult({"z"})};
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    const SdkCallContext context(deadline);
+
+    ASSERT_EQ(ER_OK, sdk_->GetWithContext(uris, buffers, context));
+    ASSERT_EQ(2u, state_->expected_size_batches.size());
+    EXPECT_EQ(64u, state_->expected_size_batches[0].size());
+    EXPECT_EQ(1u, state_->expected_size_batches[1].size());
+    for (std::size_t index = 0; index < 64; ++index) {
+        EXPECT_EQ(first_values[index], destinations[index]);
+    }
+    EXPECT_EQ("z", destinations.back());
+    ASSERT_EQ(2u, state_->get_io_deadlines.size());
+    for (const auto observed_deadline : state_->get_io_deadlines) {
+        EXPECT_EQ(deadline, observed_deadline);
+    }
+    EXPECT_EQ(std::optional<ClientErrorCode>(ER_OK), context.CompletedOutputCommit());
+}
+
+TEST_F(ValkeySdkTest, LaterGetSliceTimeoutLeavesEarlierSliceCommittedAndLaterSliceUntouched) {
+    constexpr std::size_t kBlockCount = 65;
+    std::vector<std::size_t> sizes(kBlockCount, 1);
+    std::vector<std::string> destinations;
+    std::vector<DataStorageUri> uris;
+    BlockBuffers buffers;
+    MakeCpuRequest(sizes, destinations, uris, buffers);
+    for (auto &destination : destinations) {
+        destination[0] = 'x';
+    }
+    ValkeyGetStringsResult timeout = GetResult({"ignored"});
+    timeout.errors[0] = EC_TIMEOUT;
+    state_->scripted_get_results = {GetResult(std::vector<std::string>(64, "a")), timeout};
+    const SdkCallContext context(std::chrono::steady_clock::now() + std::chrono::seconds(5));
+
+    EXPECT_EQ(ER_SDK_TIMEOUT, sdk_->GetWithContext(uris, buffers, context));
+    for (std::size_t index = 0; index < 64; ++index) {
+        EXPECT_EQ("a", destinations[index]);
+    }
+    EXPECT_EQ("x", destinations.back());
+    EXPECT_TRUE(context.HasAdmittedOutputCommit());
+    EXPECT_EQ(std::optional<ClientErrorCode>(ER_SDK_TIMEOUT), context.CompletedOutputCommit());
+}
+
+TEST_F(ValkeySdkTest, LaterGetSliceAggregatesItemErrorAndScattersValidPeer) {
+    constexpr std::size_t kBlockCount = 66;
+    std::vector<std::size_t> sizes(kBlockCount, 1);
+    std::vector<std::string> destinations;
+    std::vector<DataStorageUri> uris;
+    BlockBuffers buffers;
+    MakeCpuRequest(sizes, destinations, uris, buffers);
+    for (auto &destination : destinations) {
+        destination[0] = 'x';
+    }
+    ValkeyGetStringsResult tail = GetResult({"bad", "z"});
+    tail.errors[0] = EC_ERROR;
+    state_->scripted_get_results = {GetResult(std::vector<std::string>(64, "a")), tail};
+    const SdkCallContext context(std::chrono::steady_clock::now() + std::chrono::seconds(5));
+
+    EXPECT_EQ(ER_SDKREAD_ERROR, sdk_->GetWithContext(uris, buffers, context));
+    for (std::size_t index = 0; index < 64; ++index) {
+        EXPECT_EQ("a", destinations[index]);
+    }
+    EXPECT_EQ("x", destinations[64]);
+    EXPECT_EQ("z", destinations[65]);
+    EXPECT_EQ(std::optional<ClientErrorCode>(ER_SDKREAD_ERROR), context.CompletedOutputCommit());
+}
+
+TEST_F(ValkeySdkTest, RejectedOrTimedOutLaterPutSliceSuppressesAllOutput) {
+    constexpr std::size_t kBlockCount = 65;
+    std::vector<std::size_t> sizes(kBlockCount, 1);
+    std::vector<std::string> storage;
+    std::vector<DataStorageUri> uris;
+    BlockBuffers buffers;
+    MakeCpuRequest(sizes, storage, uris, buffers);
+    const DataStorageUri sentinel = MakeLocation("valkey-primary", "ffffffffffffffffffffffffffffffff", 1);
+    auto actual = std::make_shared<std::vector<DataStorageUri>>(1, sentinel);
+    state_->scripted_set_results = {
+        SetResult(64),
+        SetResult(1, EC_ERROR, ValkeyWriteCertainty::REJECTED),
+    };
+    const SdkCallContext context(std::chrono::steady_clock::now() + std::chrono::seconds(5));
+
+    EXPECT_EQ(ER_SDKWRITE_ERROR, sdk_->PutWithContext(uris, buffers, actual, context));
+    EXPECT_EQ(2u, state_->set_calls);
+    ASSERT_EQ(1u, actual->size());
+    EXPECT_EQ(sentinel.ToUriString(), actual->at(0).ToUriString());
+    EXPECT_FALSE(context.HasAdmittedOutputCommit());
+
+    state_->set_calls = 0;
+    state_->key_batches.clear();
+    state_->value_batches.clear();
+    state_->set_io_deadlines.clear();
+    ValkeySetStringsResult timeout = SetResult(1);
+    timeout.operation_error = EC_TIMEOUT;
+    state_->scripted_set_results = {SetResult(64), timeout};
+    const SdkCallContext timeout_context(std::chrono::steady_clock::now() + std::chrono::seconds(5));
+
+    EXPECT_EQ(ER_SDK_TIMEOUT, sdk_->PutWithContext(uris, buffers, actual, timeout_context));
+    EXPECT_EQ(2u, state_->set_calls);
+    ASSERT_EQ(1u, actual->size());
+    EXPECT_EQ(sentinel.ToUriString(), actual->at(0).ToUriString());
+    EXPECT_FALSE(timeout_context.HasAdmittedOutputCommit());
+}
+
 TEST(SdkCallContextTest, MultipleSourceReadGuardsRemainRepeatableAndBlockCancellation) {
     const SdkCallContext context(std::chrono::steady_clock::now() + std::chrono::seconds(5));
     auto first_guard = context.TryAcquireCallerMemory();
@@ -691,6 +956,20 @@ TEST(SdkCallContextTest, MultipleSourceReadGuardsRemainRepeatableAndBlockCancell
         context.CancelAndWait();
         cancellation_finished.store(true, std::memory_order_release);
     });
+    struct CancellationCleanup {
+        decltype(first_guard) &first;
+        decltype(second_guard) &second;
+        std::thread &thread;
+
+        ~CancellationCleanup() {
+            first.reset();
+            second.reset();
+            if (thread.joinable()) {
+                thread.join();
+            }
+        }
+    } cleanup{first_guard, second_guard, canceller};
+
     ASSERT_EQ(std::future_status::ready, cancel_started_future.wait_for(std::chrono::seconds(1)));
     while (context.IsLive()) {
         std::this_thread::yield();
@@ -725,141 +1004,115 @@ TEST_F(ValkeySdkTest, CancelledContextRejectsCallerMemoryAdmission) {
     EXPECT_EQ(sentinel.ToUriString(), actual->at(0).ToUriString());
 }
 
-TEST_F(ValkeySdkTest, CancellationDuringSourceReadStopsBeforeNextIovAndWaitsForGuard) {
-    char first = 'a';
-    char second = 'b';
-    BlockBuffer source;
-    source.iovs = {
-        Iov{MemoryType::CPU, &first, 1, false},
-        Iov{MemoryType::CPU, &second, 1, false},
-    };
-    const std::vector<DataStorageUri> uris{
-        MakeLocation("valkey-primary", "00000000000000000000000000000016", 2),
-    };
-    auto actual = std::make_shared<std::vector<DataStorageUri>>();
+TEST(ValkeyBoundedChunkLoopTest, CancellationStopsBeforeSecondChunkWithoutProductionHooks) {
+    constexpr std::size_t kChunkSize = valkey_sdk_internal::kCopyChunkBytes;
     const SdkCallContext context(std::chrono::steady_clock::now() + std::chrono::seconds(5));
-
-    std::promise<void> first_iov_read;
-    auto first_iov_read_future = first_iov_read.get_future();
-    std::promise<void> continue_gather;
-    auto continue_gather_future = continue_gather.get_future().share();
-    sdk_->set_source_chunk_hook([&](std::size_t, std::size_t iov_index, std::size_t) {
-        if (iov_index == 0) {
-            first_iov_read.set_value();
-            continue_gather_future.wait();
-        }
-    });
-
-    auto result = std::async(std::launch::async, [&] { return sdk_->PutWithContext(uris, {source}, actual, context); });
-    ASSERT_EQ(std::future_status::ready, first_iov_read_future.wait_for(std::chrono::seconds(1)));
-    context.Cancel();
-    continue_gather.set_value();
-
-    EXPECT_EQ(ER_SDK_TIMEOUT, result.get());
-    context.WaitForCallerMemory();
-    EXPECT_EQ(0u, state_->set_calls);
-    EXPECT_TRUE(actual->empty());
-}
-
-TEST_F(ValkeySdkTest, CancellationDuringOneLargeIovStopsAfterOneBoundedChunk) {
-    constexpr std::size_t kChunkSize = 64 * 1024;
-    std::vector<char> source(4 * kChunkSize, 'v');
-    const std::vector<DataStorageUri> uris{
-        MakeLocation("valkey-primary", "00000000000000000000000000000019", source.size()),
-    };
-    const DataStorageUri sentinel = MakeLocation("valkey-primary", "ffffffffffffffffffffffffffffffff", 1);
-    auto actual = std::make_shared<std::vector<DataStorageUri>>(1, sentinel);
-    const SdkCallContext context(std::chrono::steady_clock::now() + std::chrono::seconds(5));
-    std::promise<void> first_chunk_read;
-    auto first_chunk_read_future = first_chunk_read.get_future();
-    std::promise<void> continue_gather;
-    auto continue_gather_future = continue_gather.get_future().share();
+    std::promise<void> first_chunk_started;
+    auto first_chunk_started_future = first_chunk_started.get_future();
+    std::promise<void> release_first_chunk;
+    auto release_first_chunk_future = release_first_chunk.get_future().share();
     std::atomic<std::size_t> copied_bytes{0};
-    sdk_->set_source_chunk_hook([&](std::size_t, std::size_t, std::size_t chunk_size) {
-        const std::size_t total = copied_bytes.fetch_add(chunk_size) + chunk_size;
-        if (total == kChunkSize) {
-            first_chunk_read.set_value();
-            continue_gather_future.wait();
-        }
-    });
+    std::atomic<std::size_t> copy_calls{0};
 
     auto result = std::async(std::launch::async, [&] {
-        return sdk_->PutWithContext(uris, {CpuBuffer(source.data(), source.size())}, actual, context);
+        return valkey_sdk_internal::CopyInBoundedChunks(
+            4 * kChunkSize, context, [&](std::size_t offset, std::size_t chunk_size) {
+                const std::size_t call_index = copy_calls.fetch_add(1);
+                copied_bytes.fetch_add(chunk_size);
+                if (call_index == 0) {
+                    EXPECT_EQ(0u, offset);
+                    first_chunk_started.set_value();
+                    release_first_chunk_future.wait();
+                }
+                return ER_OK;
+            });
     });
-    ASSERT_EQ(std::future_status::ready, first_chunk_read_future.wait_for(std::chrono::seconds(1)));
+    const auto first_chunk_status = first_chunk_started_future.wait_for(std::chrono::seconds(5));
     context.Cancel();
-    continue_gather.set_value();
+    release_first_chunk.set_value();
+
+    EXPECT_EQ(std::future_status::ready, first_chunk_status);
+    EXPECT_EQ(ER_SDK_TIMEOUT, result.get());
+    EXPECT_EQ(1u, copy_calls.load());
+    EXPECT_EQ(kChunkSize, copied_bytes.load());
+}
+
+TEST_F(ValkeySdkTest, CancellationWaitsForCommittedGetGuardDuringBlockedLaterSlice) {
+    constexpr std::size_t kBlockCount = 129;
+    std::vector<std::size_t> sizes(kBlockCount, 1);
+    std::vector<std::string> destinations;
+    std::vector<DataStorageUri> uris;
+    BlockBuffers buffers;
+    MakeCpuRequest(sizes, destinations, uris, buffers);
+    for (auto &destination : destinations) {
+        destination[0] = 'x';
+    }
+
+    ValkeyGetStringsResult timeout = GetResult(std::vector<std::string>(64, "b"));
+    timeout.operation_error = EC_TIMEOUT;
+    state_->scripted_get_results = {
+        GetResult(std::vector<std::string>(64, "a")),
+        std::move(timeout),
+        GetResult({"c"}),
+    };
+    state_->blocked_get_call = 1;
+    const SdkCallContext context(std::chrono::steady_clock::now() + std::chrono::seconds(5));
+    auto result = std::async(std::launch::async, [&] { return sdk_->GetWithContext(uris, buffers, context); });
+
+    bool barrier_ready = false;
+    {
+        std::unique_lock lock(state_->barrier_mutex);
+        barrier_ready =
+            state_->barrier_cv.wait_until(lock, std::chrono::steady_clock::now() + std::chrono::seconds(5), [&] {
+                return state_->blocked_get_entered && state_->active_get_context.has_value();
+            });
+    }
+    EXPECT_TRUE(barrier_ready);
+    if (!barrier_ready) {
+        context.Cancel();
+        {
+            std::lock_guard lock(state_->barrier_mutex);
+            state_->release_blocked_get = true;
+        }
+        state_->barrier_cv.notify_all();
+        EXPECT_NE(std::future_status::timeout, result.wait_for(std::chrono::seconds(5)));
+        return;
+    }
+    for (std::size_t index = 0; index < 64; ++index) {
+        EXPECT_EQ("a", destinations[index]);
+    }
+    EXPECT_TRUE(context.HasAdmittedOutputCommit());
+
+    std::atomic<bool> cancellation_finished{false};
+    std::thread canceller([&] {
+        context.CancelAndWait();
+        cancellation_finished.store(true, std::memory_order_release);
+    });
+    const auto cancellation_watchdog = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (context.IsLive() && std::chrono::steady_clock::now() < cancellation_watchdog) {
+        std::this_thread::yield();
+    }
+    EXPECT_FALSE(context.IsLive());
+    EXPECT_FALSE(cancellation_finished.load(std::memory_order_acquire));
+    EXPECT_EQ(std::future_status::timeout, result.wait_for(std::chrono::seconds(0)));
+
+    {
+        std::lock_guard lock(state_->barrier_mutex);
+        state_->release_blocked_get = true;
+    }
+    state_->barrier_cv.notify_all();
 
     EXPECT_EQ(ER_SDK_TIMEOUT, result.get());
-    context.WaitForCallerMemory();
-    EXPECT_EQ(kChunkSize, copied_bytes.load());
-    EXPECT_EQ(0u, state_->set_calls);
-    ASSERT_EQ(1u, actual->size());
-    EXPECT_EQ(sentinel.ToUriString(), actual->at(0).ToUriString());
-    EXPECT_FALSE(context.HasAdmittedOutputCommit());
-}
-
-TEST_F(ValkeySdkTest, GetOutputCommitAdmittedBeforeDeadlineFinishesAfterDeadline) {
-    char destination[2] = {'x', 'x'};
-    BlockBuffer output;
-    output.iovs = {
-        Iov{MemoryType::CPU, destination, 1, false},
-        Iov{MemoryType::CPU, destination + 1, 1, false},
-    };
-    const std::vector<DataStorageUri> uris{
-        MakeLocation("valkey-primary", "00000000000000000000000000000017", 2),
-    };
-    state_->get_values = {"ok"};
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
-    const SdkCallContext context(deadline);
-
-    std::promise<void> commit_admitted;
-    auto commit_admitted_future = commit_admitted.get_future();
-    std::promise<void> allow_scatter;
-    auto allow_scatter_future = allow_scatter.get_future().share();
-    sdk_->set_output_commit_hook([&] {
-        commit_admitted.set_value();
-        allow_scatter_future.wait();
-    });
-
-    auto result = std::async(std::launch::async, [&] { return sdk_->GetWithContext(uris, {output}, context); });
-    ASSERT_EQ(std::future_status::ready, commit_admitted_future.wait_for(std::chrono::seconds(1)));
-    std::this_thread::sleep_until(deadline + std::chrono::milliseconds(50));
-    allow_scatter.set_value();
-
-    EXPECT_EQ(ER_OK, result.get());
-    EXPECT_EQ("ok", std::string(destination, sizeof(destination)));
-    context.CancelAndWait();
-}
-
-TEST_F(ValkeySdkTest, PutOutputCommitAdmittedBeforeDeadlineFinishesAfterDeadline) {
-    char source = 'v';
-    const std::vector<DataStorageUri> uris{
-        MakeLocation("valkey-primary", "00000000000000000000000000000018", 1),
-    };
-    auto actual = std::make_shared<std::vector<DataStorageUri>>();
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
-    const SdkCallContext context(deadline);
-
-    std::promise<void> commit_admitted;
-    auto commit_admitted_future = commit_admitted.get_future();
-    std::promise<void> allow_publication;
-    auto allow_publication_future = allow_publication.get_future().share();
-    sdk_->set_output_commit_hook([&] {
-        commit_admitted.set_value();
-        allow_publication_future.wait();
-    });
-
-    auto result = std::async(std::launch::async,
-                             [&] { return sdk_->PutWithContext(uris, {CpuBuffer(&source, 1)}, actual, context); });
-    ASSERT_EQ(std::future_status::ready, commit_admitted_future.wait_for(std::chrono::seconds(1)));
-    std::this_thread::sleep_until(deadline + std::chrono::milliseconds(50));
-    allow_publication.set_value();
-
-    EXPECT_EQ(ER_OK, result.get());
-    ASSERT_EQ(1u, actual->size());
-    EXPECT_EQ(uris[0].ToUriString(), (*actual)[0].ToUriString());
-    context.CancelAndWait();
+    canceller.join();
+    EXPECT_TRUE(cancellation_finished.load(std::memory_order_acquire));
+    EXPECT_EQ(2u, state_->get_calls);
+    for (std::size_t index = 0; index < 64; ++index) {
+        EXPECT_EQ("a", destinations[index]);
+    }
+    for (std::size_t index = 64; index < destinations.size(); ++index) {
+        EXPECT_EQ("x", destinations[index]);
+    }
+    EXPECT_EQ(std::optional<ClientErrorCode>(ER_SDK_TIMEOUT), context.CompletedOutputCommit());
 }
 
 } // namespace

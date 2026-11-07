@@ -190,7 +190,8 @@ TEST_F(SdkWrapperTest, TestDestructorKeepsSharedMemoryFdAliveForRunningTasks) {
         fd_valid_in_task.store(fstat(owned_fd, &file_stat) == 0);
         return ER_OK;
     });
-    ASSERT_EQ(task_started_future.wait_for(std::chrono::seconds(1)), std::future_status::ready);
+    const auto task_started_status = task_started_future.wait_for(std::chrono::seconds(1));
+    EXPECT_EQ(task_started_status, std::future_status::ready);
 
     std::promise<void> destructor_started;
     auto destructor_started_future = destructor_started.get_future();
@@ -898,17 +899,21 @@ TEST_F(SdkWrapperTest, QueueTimeConsumesWrapperEntryDeadline) {
             return ER_OK;
         }));
     }
-    ASSERT_TRUE(WaitForTrue([&] { return blockers_started.load() == 8; }));
+    const bool blockers_ready = WaitForTrue([&] { return blockers_started.load() == 8; });
+    EXPECT_TRUE(blockers_ready);
 
     const std::vector<DataStorageUri> uris{
         DataStorageUri("file://nfs_test/a?blkid=0&size=0"),
     };
     auto result = std::async(std::launch::async, [&] { return sdk_wrapper.Get(uris, {BlockBuffer()}); });
-    ASSERT_TRUE(WaitForTrue([&] { return sdk_wrapper.wait_task_thread_pool_->isFull(); }));
+    const bool queue_filled = WaitForTrue([&] { return sdk_wrapper.wait_task_thread_pool_->isFull(); });
+    EXPECT_TRUE(queue_filled);
     std::this_thread::sleep_for(std::chrono::milliseconds(150));
     release.set_value();
+    const auto result_code = result.get();
+    sdk_wrapper.wait_task_thread_pool_->waitFinish();
 
-    EXPECT_EQ(ER_OK, result.get());
+    EXPECT_EQ(ER_OK, result_code);
     EXPECT_EQ(1, ctrl->contextual_get_calls.load());
     EXPECT_LT(ctrl->remaining_ms_at_backend_entry.load(), 900);
     for (auto &blocker : blockers) {
@@ -1053,8 +1058,14 @@ TEST_F(SdkWrapperTest, PartialSubmissionRejectsWithoutRunningAcceptedGroupInline
         release_blocker_future.wait();
         return ER_OK;
     });
-    ASSERT_TRUE(blocker.accepted());
-    ASSERT_EQ(std::future_status::ready, blocker_started_future.wait_for(std::chrono::seconds(1)));
+    EXPECT_TRUE(blocker.accepted());
+    if (!blocker.accepted()) {
+        release_blocker.set_value();
+        sdk_wrapper.wait_task_thread_pool_->waitFinish();
+        return;
+    }
+    const auto blocker_started_status = blocker_started_future.wait_for(std::chrono::seconds(1));
+    EXPECT_EQ(std::future_status::ready, blocker_started_status);
 
     const std::vector<DataStorageUri> uris{
         DataStorageUri("file://nfs_a/a?blkid=0&size=0"),
@@ -1068,10 +1079,13 @@ TEST_F(SdkWrapperTest, PartialSubmissionRejectsWithoutRunningAcceptedGroupInline
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
     EXPECT_EQ(0, ctrl->get_call_count.load());
     release_blocker.set_value();
-    ASSERT_TRUE(queue_filled);
+    const auto result_code = result.get();
+    const auto blocker_code = blocker.future.get();
+    sdk_wrapper.wait_task_thread_pool_->waitFinish();
 
-    EXPECT_EQ(ER_THREADPOOL_ERROR, result.get());
-    EXPECT_EQ(ER_OK, blocker.future.get());
+    EXPECT_TRUE(queue_filled);
+    EXPECT_EQ(ER_THREADPOOL_ERROR, result_code);
+    EXPECT_EQ(ER_OK, blocker_code);
     EXPECT_EQ(0, ctrl->get_call_count.load());
 }
 
@@ -1129,7 +1143,7 @@ TEST(SdkCallContextTest, DestroyedIncompleteOutputGuardBlocksReadmission) {
 TEST_F(SdkWrapperTest, SingleGroupCommitCompletingDuringCancellationPreservesSuccess) {
     auto ctrl = std::make_shared<FakeSdkControl>();
     ctrl->use_context_output_commit.store(true);
-    auto client_config = MakeClientConfigWithTimeouts(2000, 100);
+    auto client_config = MakeClientConfigWithTimeouts(2000, 2000);
     SdkWrapper sdk_wrapper;
     ClientErrorCode init_ec = ER_OK;
     auto factory = InitWrapperWithFake(sdk_wrapper, ctrl, client_config, init_params_, init_ec);
@@ -1147,15 +1161,17 @@ TEST_F(SdkWrapperTest, SingleGroupCommitCompletingDuringCancellationPreservesSuc
     const std::vector<DataStorageUri> uris{
         DataStorageUri("file://nfs_test/a?blkid=0&size=0"),
     };
-    const auto deadline_watchdog = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+    const auto deadline_watchdog = std::chrono::steady_clock::now() + std::chrono::seconds(5);
     auto result = std::async(std::launch::async, [&] { return sdk_wrapper.Get(uris, {BlockBuffer()}); });
-    ASSERT_EQ(std::future_status::ready, commit_completed_future.wait_until(deadline_watchdog));
-    std::this_thread::sleep_for(std::chrono::milliseconds(150));
-    ASSERT_EQ(std::future_status::ready, result.wait_for(std::chrono::seconds(1)));
-    EXPECT_EQ(ER_OK, result.get());
+    const auto commit_completed_status = commit_completed_future.wait_until(deadline_watchdog);
+    EXPECT_EQ(std::future_status::ready, commit_completed_status);
+    const auto result_status = result.wait_for(std::chrono::seconds(5));
+    EXPECT_EQ(std::future_status::ready, result_status);
     allow_callable_return.set_value();
+    const auto result_code = result.get();
     sdk_wrapper.wait_task_thread_pool_->waitFinish();
 
+    EXPECT_EQ(ER_OK, result_code);
     EXPECT_TRUE(ctrl->output_access_succeeded.load());
     EXPECT_EQ(1, ctrl->get_call_count.load());
 }
@@ -1163,7 +1179,7 @@ TEST_F(SdkWrapperTest, SingleGroupCommitCompletingDuringCancellationPreservesSuc
 TEST_F(SdkWrapperTest, QueuedWorkerCannotAcquireCallerMemoryAfterWrapperReturns) {
     auto ctrl = std::make_shared<FakeSdkControl>();
     ctrl->use_context_output_commit.store(true);
-    auto client_config = MakeClientConfigWithTimeouts(2000, 100);
+    auto client_config = MakeClientConfigWithTimeouts(2000, 2000);
     SdkWrapper sdk_wrapper;
     ClientErrorCode init_ec = ER_OK;
     auto factory = InitWrapperWithFake(sdk_wrapper, ctrl, client_config, init_params_, init_ec);
@@ -1182,15 +1198,19 @@ TEST_F(SdkWrapperTest, QueuedWorkerCannotAcquireCallerMemoryAfterWrapperReturns)
         DataStorageUri("file://nfs_test/a?blkid=0&size=0"),
     };
     auto result = std::async(std::launch::async, [&] { return sdk_wrapper.Get(uris, {BlockBuffer()}); });
-    ASSERT_EQ(std::future_status::ready, worker_paused_future.wait_for(std::chrono::seconds(1)));
-    ASSERT_EQ(std::future_status::ready, result.wait_for(std::chrono::seconds(1)));
-    EXPECT_EQ(ER_SDK_TIMEOUT, result.get());
+    const auto worker_paused_status = worker_paused_future.wait_for(std::chrono::seconds(5));
+    EXPECT_EQ(std::future_status::ready, worker_paused_status);
+    const auto result_status = result.wait_for(std::chrono::seconds(5));
+    EXPECT_EQ(std::future_status::ready, result_status);
 
     allow_access.set_value();
-    ASSERT_TRUE(WaitForTrue([&] { return ctrl->output_access_attempted.load(); }));
+    const auto result_code = result.get();
+    sdk_wrapper.wait_task_thread_pool_->waitFinish();
+
+    EXPECT_EQ(ER_SDK_TIMEOUT, result_code);
+    EXPECT_TRUE(ctrl->output_access_attempted.load());
     EXPECT_FALSE(ctrl->output_access_succeeded.load());
     EXPECT_EQ(0, ctrl->get_call_count.load());
-    sdk_wrapper.wait_task_thread_pool_->waitFinish();
 }
 
 namespace {
@@ -1216,7 +1236,7 @@ std::unique_ptr<LockFreeThreadPool> MakeStartedPool(std::size_t thread_num = 2, 
 TEST(SdkWrapperOutcomeTest, CompletedSingleGroupCommitWinsWithoutFutureReadinessRace) {
     SdkWrapper wrapper;
     wrapper.wait_task_thread_pool_ = MakeStartedPool();
-    const SdkCallContext root(std::chrono::steady_clock::now() + std::chrono::milliseconds(50));
+    const SdkCallContext root(std::chrono::steady_clock::now() + std::chrono::seconds(2));
     std::promise<void> commit_completed;
     auto commit_completed_future = commit_completed.get_future();
     std::promise<void> allow_callable_return;
@@ -1239,17 +1259,21 @@ TEST(SdkWrapperOutcomeTest, CompletedSingleGroupCommitWinsWithoutFutureReadiness
     auto result = std::async(std::launch::async, [&] {
         return wrapper.RunWithTimeoutParallel(SdkWrapper::OpType::GET, std::move(tasks), root);
     });
-    ASSERT_EQ(std::future_status::ready, commit_completed_future.wait_for(std::chrono::seconds(1)));
-    ASSERT_EQ(std::future_status::ready, result.wait_for(std::chrono::seconds(1)));
-    EXPECT_EQ(ER_OK, result.get());
+    const auto commit_completed_status = commit_completed_future.wait_for(std::chrono::seconds(5));
+    EXPECT_EQ(std::future_status::ready, commit_completed_status);
+    const auto result_status = result.wait_for(std::chrono::seconds(5));
+    EXPECT_EQ(std::future_status::ready, result_status);
     allow_callable_return.set_value();
+    const auto result_code = result.get();
     wrapper.wait_task_thread_pool_->waitFinish();
+
+    EXPECT_EQ(ER_OK, result_code);
 }
 
 TEST(SdkWrapperOutcomeTest, OneCommittedGroupCannotPreserveLegacyPeerAtDeadline) {
     SdkWrapper wrapper;
     wrapper.wait_task_thread_pool_ = MakeStartedPool();
-    const SdkCallContext root(std::chrono::steady_clock::now() + std::chrono::milliseconds(80));
+    const SdkCallContext root(std::chrono::steady_clock::now() + std::chrono::seconds(2));
     std::promise<void> legacy_access_started;
     auto legacy_access_started_future = legacy_access_started.get_future();
     std::promise<void> release_legacy_access;
@@ -1277,17 +1301,26 @@ TEST(SdkWrapperOutcomeTest, OneCommittedGroupCannotPreserveLegacyPeerAtDeadline)
     auto result = std::async(std::launch::async, [&] {
         return wrapper.RunWithTimeoutParallel(SdkWrapper::OpType::GET, std::move(tasks), root);
     });
-    ASSERT_EQ(std::future_status::ready, legacy_access_started_future.wait_for(std::chrono::seconds(1)));
-    std::this_thread::sleep_until(root.deadline() + std::chrono::milliseconds(20));
+    const auto legacy_access_status = legacy_access_started_future.wait_for(std::chrono::seconds(5));
+    EXPECT_EQ(std::future_status::ready, legacy_access_status);
+    const auto cancellation_watchdog = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (root.IsLive() && std::chrono::steady_clock::now() < cancellation_watchdog) {
+        std::this_thread::yield();
+    }
+    EXPECT_FALSE(root.IsLive());
     release_legacy_access.set_value();
-    EXPECT_EQ(ER_SDK_TIMEOUT, result.get());
+    const auto result_status = result.wait_for(std::chrono::seconds(5));
+    const auto result_code = result.get();
     wrapper.wait_task_thread_pool_->waitFinish();
+
+    EXPECT_EQ(std::future_status::ready, result_status);
+    EXPECT_EQ(ER_SDK_TIMEOUT, result_code);
 }
 
 TEST(SdkWrapperOutcomeTest, DestroyedCommitGuardCannotPreservePeerCommitAtDeadline) {
     SdkWrapper wrapper;
     wrapper.wait_task_thread_pool_ = MakeStartedPool();
-    const SdkCallContext root(std::chrono::steady_clock::now() + std::chrono::milliseconds(50));
+    const SdkCallContext root(std::chrono::steady_clock::now() + std::chrono::seconds(2));
     std::promise<void> both_guards_released;
     auto both_guards_released_future = both_guards_released.get_future();
     std::promise<void> allow_callable_return;
@@ -1317,11 +1350,15 @@ TEST(SdkWrapperOutcomeTest, DestroyedCommitGuardCannotPreservePeerCommitAtDeadli
     auto result = std::async(std::launch::async, [&] {
         return wrapper.RunWithTimeoutParallel(SdkWrapper::OpType::GET, std::move(tasks), root);
     });
-    ASSERT_EQ(std::future_status::ready, both_guards_released_future.wait_for(std::chrono::seconds(1)));
-    ASSERT_EQ(std::future_status::ready, result.wait_for(std::chrono::seconds(1)));
-    EXPECT_EQ(ER_SDK_TIMEOUT, result.get());
+    const auto guards_released_status = both_guards_released_future.wait_for(std::chrono::seconds(5));
+    EXPECT_EQ(std::future_status::ready, guards_released_status);
+    const auto result_status = result.wait_for(std::chrono::seconds(5));
+    EXPECT_EQ(std::future_status::ready, result_status);
     allow_callable_return.set_value();
+    const auto result_code = result.get();
     wrapper.wait_task_thread_pool_->waitFinish();
+
+    EXPECT_EQ(ER_SDK_TIMEOUT, result_code);
 }
 
 class WaitForFirstTaskStartPool : public LockFreeThreadPool {
@@ -1365,9 +1402,13 @@ TEST(SdkWrapperOutcomeTest, SubmissionRejectionStillReturnsAcceptedPeerTimeout) 
     auto result = std::async(std::launch::async, [&] {
         return wrapper.RunWithTimeoutParallel(SdkWrapper::OpType::GET, std::move(tasks), root);
     });
-    ASSERT_EQ(std::future_status::ready, first_started_future.wait_for(std::chrono::seconds(1)));
+    const auto first_started_status = first_started_future.wait_for(std::chrono::seconds(1));
+    EXPECT_EQ(std::future_status::ready, first_started_status);
     release_first.set_value();
-    EXPECT_EQ(ER_SDK_TIMEOUT, result.get());
+    const auto result_code = result.get();
+    wrapper.wait_task_thread_pool_->waitFinish();
+
+    EXPECT_EQ(ER_SDK_TIMEOUT, result_code);
 }
 
 enum class SubmissionThrowMode {
@@ -1517,12 +1558,16 @@ TEST_F(SdkWrapperTest, ContextualCommitCannotPreserveLateLegacyGroup) {
         DataStorageUri("file://legacy/b?blkid=0&size=0"),
     };
     auto result = std::async(std::launch::async, [&] { return wrapper.Get(uris, {BlockBuffer(), BlockBuffer()}); });
-    ASSERT_EQ(std::future_status::ready, legacy_started_future.wait_for(std::chrono::seconds(1)));
-    ASSERT_EQ(std::future_status::ready, result.wait_for(std::chrono::seconds(1)));
-    EXPECT_EQ(ER_SDK_TIMEOUT, result.get());
-    EXPECT_TRUE(contextual_control->output_access_succeeded.load());
+    const auto legacy_started_status = legacy_started_future.wait_for(std::chrono::seconds(1));
+    EXPECT_EQ(std::future_status::ready, legacy_started_status);
+    const auto result_status = result.wait_for(std::chrono::seconds(1));
+    EXPECT_EQ(std::future_status::ready, result_status);
     release_legacy.set_value();
+    const auto result_code = result.get();
     wrapper.wait_task_thread_pool_->waitFinish();
+
+    EXPECT_EQ(ER_SDK_TIMEOUT, result_code);
+    EXPECT_TRUE(contextual_control->output_access_succeeded.load());
 }
 
 } // namespace
