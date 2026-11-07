@@ -469,8 +469,20 @@ class ValkeyStorageCliTest(unittest.TestCase):
         self.assertEqual("ST_VALKEY", storage["storage_type"])
         self.assertEqual({"endpoint": self.endpoint}, storage["valkey"])
 
+    @staticmethod
+    def _list_response(storage_type, spec_field="valkey", name="valkey_primary"):
+        return {
+            "header": {"status": {"code": "OK"}},
+            "storage": [
+                {"global_unique_name": "other", "storage_type": "ST_NFS", "nfs": {}},
+                {"global_unique_name": name, "storage_type": storage_type, spec_field: {}},
+            ],
+        }
+
     @patch.object(update_storage, "http_post_and_print")
-    def test_update_subcommand_uses_same_coherent_payload(self, mock_post):
+    @patch.object(update_storage, "http_post")
+    def test_update_subcommand_uses_same_coherent_payload(self, mock_http_post, mock_post):
+        mock_http_post.return_value = self._list_response("ST_VALKEY")
         argv = [
             "update_storage",
             "-u",
@@ -481,9 +493,39 @@ class ValkeyStorageCliTest(unittest.TestCase):
         ]
         with patch.object(sys, "argv", argv):
             update_storage.main()
+        self.assertEqual("/api/listStorage", mock_http_post.call_args.args[1])
         storage = mock_post.call_args.args[1]["storage"]
         self.assertEqual("ST_VALKEY", storage["storage_type"])
         self.assertEqual({"endpoint": self.endpoint}, storage["valkey"])
+
+    @patch.object(update_storage, "http_post_and_print")
+    @patch.object(update_storage, "http_post")
+    def test_update_accepts_numeric_valkey_storage_type(self, mock_http_post, mock_post):
+        mock_http_post.return_value = self._list_response(10)
+        args = argparse.Namespace(
+            host="localhost", trace_id="trace", unique_name="valkey_primary",
+            verbose=False, endpoint=self.endpoint)
+        update_storage.handle_valkey(args)
+        self.assertEqual("ST_VALKEY", mock_post.call_args.args[1]["storage"]["storage_type"])
+
+    @patch.object(update_storage, "http_post_and_print")
+    @patch.object(update_storage, "http_post")
+    def test_update_refuses_to_change_existing_storage_type(self, mock_http_post, mock_post):
+        args = argparse.Namespace(
+            host="localhost", trace_id="trace", unique_name="valkey_primary",
+            verbose=False, endpoint=self.endpoint)
+        cases = (
+            (self._list_response("ST_NFS", spec_field="nfs"), "storage_type ST_NFS"),
+            (self._list_response("ST_UNSPECIFIED", spec_field="nfs"), "storage_type ST_UNSPECIFIED"),
+            (self._list_response("ST_VALKEY", name="another"), "does not exist"),
+            ({"header": {"status": {"code": "INTERNAL_ERROR"}}}, "list storage failed"),
+        )
+        for response, message in cases:
+            with self.subTest(message=message):
+                mock_http_post.return_value = response
+                with self.assertRaisesRegex(RuntimeError, message):
+                    update_storage.handle_valkey(args)
+        mock_post.assert_not_called()
 
     @patch.object(add_storage, "pretty_print_json")
     @patch.object(add_storage, "http_post")
