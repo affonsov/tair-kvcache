@@ -351,6 +351,11 @@ TEST(ValkeySdkInitTest, ValidatesConfigsInitializesSeparateTimedPoolsAndReportsT
     for (std::size_t i = 4; i < 8; ++i) {
         EXPECT_EQ("valkey://cache.internal:6379/?db=11&timeout_ms=17", valid.created_endpoints()[i]);
     }
+    // A second Init must not replace the published pools, identity, or timeouts.
+    EXPECT_EQ(ER_SDKINIT_ERROR,
+              valid.Init(MakeSdkConfig(29, 31), MakeStorageConfig("other-storage", "valkey://other:6379/?db=2")));
+    EXPECT_EQ(8u, state->prepare_calls);
+    EXPECT_EQ(8u, valid.created_endpoints().size());
 
     TestValkeySdk redis_alias(state);
     ASSERT_EQ(ER_OK,
