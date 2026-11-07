@@ -68,11 +68,17 @@ void ProtoConvert::StorageConfigToProto(const StorageConfig &storage_config,
         dummy->set_root_path(dummy_storage.root_path());
         dummy->set_key_count_per_file(dummy_storage.key_count_per_file());
     } else if (type == DataStorageType::DATA_STORAGE_TYPE_VALKEY) {
-        const auto &valkey_storage = *std::dynamic_pointer_cast<ValkeyStorageSpec>(storage_config.storage_spec());
-        auto *proto_valkey = proto_storage_config->mutable_valkey();
-        proto_valkey->set_endpoint(valkey_storage.endpoint());
-        proto_valkey->set_security_dir(valkey_storage.security_dir());
         proto_storage_config->set_storage_type(proto::admin::ST_VALKEY);
+        const auto valkey_storage = std::dynamic_pointer_cast<ValkeyStorageSpec>(storage_config.storage_spec());
+        if (valkey_storage == nullptr) {
+            // ListStorage converts every registered storage; never dereference a missing spec.
+            KVCM_LOG_WARN("valkey storage [%s] has no Valkey storage spec; omitting spec fields",
+                          storage_config.global_unique_name().c_str());
+        } else {
+            auto *proto_valkey = proto_storage_config->mutable_valkey();
+            proto_valkey->set_endpoint(valkey_storage->endpoint());
+            proto_valkey->set_security_dir(valkey_storage->security_dir());
+        }
     } else if (IsEventReportStorageType(type)) {
         const auto &er_spec = *std::dynamic_pointer_cast<EventReportStorageSpec>(storage_config.storage_spec());
         proto::admin::EventReportStorageSpec *spec = proto_storage_config->mutable_event_report();

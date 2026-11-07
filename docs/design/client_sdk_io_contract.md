@@ -92,7 +92,7 @@ does not admit an output commit. Once a slice starts scattering under an
 admitted guard, that synchronous scatter finishes without a per-IOV deadline
 check. Before another slice begins I/O, cancellation and the original deadline
 are checked again. Cancellation can therefore wait only for the current
-synchronous copy and any current PR2 deadline-bounded Redis I/O. No host or
+synchronous copy and any current deadline-bounded Redis I/O. No host or
 device copy remains in flight after guard release or function return.
 
 Bounded memory requires partial publication for Get: if an earlier successful
@@ -147,8 +147,8 @@ the Valkey SDK:
 
 The connector contract therefore requires no duplicate Valkey GPU staging.
 Direct `TransferClient` callers can submit GPU IOVs and receive the synchronous
-Valkey staging behavior above. Final live framework qualification remains
-PR5-owned.
+Valkey staging behavior above. The framework connectors have not yet been
+qualified end to end against a live Valkey deployment.
 
 ## Result mapping and known limitations
 
@@ -177,7 +177,7 @@ PR5-owned.
 7. ManagerClient and RTPLLMClient calls that use TransferClient receive the
    wrapper budget without extra configuration.
 
-TLS, ACLs, `security_dir`, credential loading/references, and authenticated
-live-CI selection remain PR5-owned. PR4 does not duplicate or alter those
-fields, the live Valkey test tags, or the CI workflow that selects authenticated
-coverage.
+This contract applies to the plaintext `valkey://` and `redis://` transports and
+to `valkeys://`. TLS, named ACL authentication, and the `security_dir`
+credential reference are described in
+[Secure Valkey block storage](secure_valkey_storage.md).
