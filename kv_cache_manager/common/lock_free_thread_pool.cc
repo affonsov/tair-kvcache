@@ -22,4 +22,18 @@ void LockFreeThreadPool::stop() { pool_->stop(); }
 void LockFreeThreadPool::waitFinish() { pool_->waitFinish(); }
 bool LockFreeThreadPool::isFull() const { return pool_->isFull(); }
 
+LockFreeThreadPool::SubmissionStatus LockFreeThreadPool::TryPush(std::function<void()> &&task) {
+    switch (pool_->pushTask(std::move(task), false, false)) {
+    case autil::ThreadPoolBase::ERROR_NONE:
+        return SubmissionStatus::ACCEPTED;
+    case autil::ThreadPoolBase::ERROR_POOL_HAS_STOP:
+        return SubmissionStatus::POOL_STOPPED;
+    case autil::ThreadPoolBase::ERROR_POOL_ITEM_IS_NULL:
+        return SubmissionStatus::ITEM_IS_NULL;
+    case autil::ThreadPoolBase::ERROR_POOL_QUEUE_FULL:
+        return SubmissionStatus::QUEUE_FULL;
+    }
+    return SubmissionStatus::POOL_STOPPED;
+}
+
 } // namespace kv_cache_manager
