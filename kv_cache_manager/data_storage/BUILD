@@ -68,6 +68,35 @@ cc_library(
 )
 
 cc_library(
+    name = "valkey_uri_util",
+    srcs = [
+        "valkey_uri_util.cc",
+    ],
+    hdrs = [
+        "valkey_uri_util.h",
+    ],
+    deps = [
+        ":common_define",
+    ],
+)
+
+cc_library(
+    name = "valkey_backend",
+    srcs = [
+        "valkey_backend.cc",
+    ],
+    hdrs = [
+        "valkey_backend.h",
+    ],
+    deps = [
+        ":common_define",
+        ":valkey_uri_util",
+        "//kv_cache_manager/common:client_pool",
+        "//kv_cache_manager/common:redis_client",
+    ],
+)
+
+cc_library(
     name = "common_define",
     srcs = [
         "storage_config.cc",
