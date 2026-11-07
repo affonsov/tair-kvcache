@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cstddef>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -95,6 +96,9 @@ private:
 
     std::string storage_identity_;
     SdkTimeoutConfig timeout_config_;
+    // Init succeeds at most once. Get/Put read the pools, identity, and timeouts
+    // without locking, so they must never be replaced after publication.
+    std::mutex init_mutex_;
     std::unique_ptr<RedisClientPool> get_client_pool_;
     std::unique_ptr<RedisClientPool> put_client_pool_;
 };

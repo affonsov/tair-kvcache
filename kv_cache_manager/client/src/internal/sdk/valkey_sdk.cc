@@ -175,6 +175,11 @@ ClientErrorCode CopyToCaller(const Iov &iov, const char *source) {
 
 ClientErrorCode ValkeySdk::Init(const std::shared_ptr<SdkBackendConfig> &sdk_backend_config,
                                 const std::shared_ptr<StorageConfig> &storage_config) {
+    std::lock_guard init_lock(init_mutex_);
+    if (get_client_pool_ || put_client_pool_) {
+        KVCM_LOG_WARN("valkey sdk is already initialized; reinitialization is not supported");
+        return ER_SDKINIT_ERROR;
+    }
     if (!sdk_backend_config || !sdk_backend_config->Validate() || !sdk_backend_config->timeout_config().Validate() ||
         sdk_backend_config->type() != DataStorageType::DATA_STORAGE_TYPE_VALKEY) {
         return ER_INVALID_SDKBACKEND_CONFIG;
