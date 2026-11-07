@@ -30,6 +30,8 @@ def create_add_storage_data(args, storage_type: str, storage_spec: dict):
         storage["storage_type"] = args.event_report_storage_type
     elif storage_type == "tair_mem_pool":
         storage["storage_type"] = get_pace_storage_type(args.media_type)
+    elif storage_type == "valkey":
+        storage["storage_type"] = "ST_VALKEY"
     return {
         "trace_id": args.trace_id,
         "storage": storage
@@ -65,8 +67,15 @@ def handle_event_report(args):
     http_post_and_print(args.host, data, args.verbose)
 
 
+def handle_valkey(args):
+    storage_spec = gen_valkey_config_data(args)
+    data = create_add_storage_data(args, "valkey", storage_spec)
+    http_post_and_print(args.host, data, args.verbose)
+
+
 def main():
-    add_or_update_main("add_storage", handle_nfs, handle_pace, handle_3fs, handle_event_report)
+    add_or_update_main(
+        "add_storage", handle_nfs, handle_pace, handle_3fs, handle_event_report, handle_valkey)
 
 
 if __name__ == "__main__":

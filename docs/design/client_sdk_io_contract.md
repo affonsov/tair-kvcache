@@ -131,10 +131,24 @@ or touching their addresses. All device copies are synchronous, and the
 worker's original current device is restored before the contextual call
 returns.
 
-The maintained vLLM, SGLang, and TensorRT-LLM connectors already submit CPU
-IOVs because their connector paths stage through host buffers. Direct
-`TransferClient` callers can now submit GPU IOVs and receive the synchronous
-Valkey staging behavior above.
+The maintained framework connectors construct CPU IOVs before calling the
+public `TransferClient`; they do not pass framework device buffers directly to
+the Valkey SDK:
+
+- vLLM's `KVCacheDataTransfer._make_block_buffers` creates one
+  `MemoryType.CPU` IOV per block over its host staging pool, which is pinned
+  on CUDA, before `SaveKvCaches` or `LoadKvCaches`.
+- SGLang's `_prepare_buffers` and `_prepare_extra_pool_buffers` create
+  `MemoryType.CPU` IOVs from the connector-provided host page pointers before
+  either transfer call.
+- TensorRT-LLM's `_prepare_buffers` first materializes each cache block with
+  `.cpu()`, then creates a `MemoryType.CPU` IOV. Loads synchronously copy that
+  host tensor back to the framework cache after `LoadKvCaches` returns.
+
+The connector contract therefore requires no duplicate Valkey GPU staging.
+Direct `TransferClient` callers can submit GPU IOVs and receive the synchronous
+Valkey staging behavior above. Final live framework qualification remains
+PR5-owned.
 
 ## Result mapping and known limitations
 
@@ -163,6 +177,7 @@ Valkey staging behavior above.
 7. ManagerClient and RTPLLMClient calls that use TransferClient receive the
    wrapper budget without extra configuration.
 
-TLS, ACLs, credential references, and authenticated live-CI selection remain
-PR5-owned. In particular, PR3 does not duplicate or alter the live Valkey CI
-tag/comment used to select authenticated coverage.
+TLS, ACLs, `security_dir`, credential loading/references, and authenticated
+live-CI selection remain PR5-owned. PR4 does not duplicate or alter those
+fields, the live Valkey test tags, or the CI workflow that selects authenticated
+coverage.
