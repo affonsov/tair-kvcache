@@ -201,6 +201,7 @@ TEST_F(RedisClientRealServiceTest, TestDeadlineBoundedBinaryStrings) {
     EXPECT_EQ(EC_OK, set_result.operation_error);
     EXPECT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}), set_result.errors);
     EXPECT_EQ(2u, set_result.confirmed_count);
+    EXPECT_EQ(0u, set_result.RejectedCount());
     EXPECT_EQ(0u, set_result.ambiguous_count);
     EXPECT_EQ(0u, set_result.not_sent_count);
 

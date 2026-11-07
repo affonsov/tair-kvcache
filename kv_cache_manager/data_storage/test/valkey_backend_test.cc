@@ -2,6 +2,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <unordered_set>
 #include <utility>
@@ -123,6 +124,14 @@ public:
     std::string CallGenerateOpaqueId() { return ValkeyDataStorageBackend::GenerateOpaqueId(); }
 };
 
+class ThrowingOpaqueIdValkeyBackend : public TestValkeyBackend {
+public:
+    using TestValkeyBackend::TestValkeyBackend;
+
+protected:
+    std::string GenerateOpaqueId() override { throw std::runtime_error("injected generator failure"); }
+};
+
 StorageConfig MakeValkeyConfig(const std::string &identity = "valkey-primary",
                                const std::string &endpoint = "valkey://cache.internal:6379/?db=11") {
     auto spec = std::make_shared<ValkeyStorageSpec>();
@@ -195,17 +204,20 @@ TEST_F(ValkeyBackendTest, LocationUriAndRedisKeyAreStrictAndNamespaced) {
     }
 }
 
-TEST_F(ValkeyBackendTest, GeneratedOpaqueIdIsAcceptedLowercaseHex) {
+TEST_F(ValkeyBackendTest, GeneratedOpaqueIdsAreUniqueLowercaseHex) {
     RealOpaqueIdValkeyBackend backend(metrics_registry_);
-    const std::string opaque_id = backend.CallGenerateOpaqueId();
-
-    ASSERT_EQ(32u, opaque_id.size());
-    EXPECT_TRUE(std::all_of(opaque_id.begin(), opaque_id.end(), [](const char c) {
-        return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
-    }));
-    DataStorageUri uri;
-    EXPECT_TRUE(BuildValkeyLocation("valkey-primary", opaque_id, 128, uri));
-    EXPECT_TRUE(ValidateValkeyLocation(uri, "valkey-primary"));
+    std::unordered_set<std::string> opaque_ids;
+    for (std::size_t i = 0; i < 256; ++i) {
+        const std::string opaque_id = backend.CallGenerateOpaqueId();
+        ASSERT_EQ(32u, opaque_id.size());
+        EXPECT_TRUE(std::all_of(opaque_id.begin(), opaque_id.end(), [](const char c) {
+            return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+        }));
+        EXPECT_TRUE(opaque_ids.insert(opaque_id).second);
+        DataStorageUri uri;
+        EXPECT_TRUE(BuildValkeyLocation("valkey-primary", opaque_id, 128, uri));
+        EXPECT_TRUE(ValidateValkeyLocation(uri, "valkey-primary"));
+    }
 }
 
 TEST_F(ValkeyBackendTest, InheritedOpenInitializesAndCloseClearsAvailability) {
@@ -312,6 +324,23 @@ TEST_F(ValkeyBackendTest, CreateReturnsUniqueSecretFreeLocationsWithoutRedisIo) 
     EXPECT_EQ(EC_ERROR, closed[1].first);
     EXPECT_FALSE(closed[0].second.Valid());
     EXPECT_FALSE(closed[1].second.Valid());
+    EXPECT_EQ(0u, state_->io_calls);
+}
+
+TEST_F(ValkeyBackendTest, CreateContainsOpaqueIdGeneratorFailureAndRunsCallback) {
+    ThrowingOpaqueIdValkeyBackend backend(metrics_registry_, state_);
+    ASSERT_EQ(EC_OK, backend.Open(MakeValkeyConfig(), "trace"));
+
+    int callback_count = 0;
+    std::vector<std::pair<ErrorCode, DataStorageUri>> result;
+    EXPECT_NO_THROW(result = backend.Create({"first", "second"}, 512, "trace", [&] { ++callback_count; }));
+
+    ASSERT_EQ(2u, result.size());
+    EXPECT_EQ(1, callback_count);
+    EXPECT_EQ(EC_ERROR, result[0].first);
+    EXPECT_EQ(EC_ERROR, result[1].first);
+    EXPECT_FALSE(result[0].second.Valid());
+    EXPECT_FALSE(result[1].second.Valid());
     EXPECT_EQ(0u, state_->io_calls);
 }
 
