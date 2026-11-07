@@ -4,10 +4,10 @@
 #include "kv_cache_manager/client/src/internal/sdk/hf3fs_sdk.h"
 #endif
 #include "kv_cache_manager/client/src/internal/sdk/local_file_sdk.h"
+#include "kv_cache_manager/client/src/internal/sdk/valkey_sdk.h"
 #ifdef ENABLE_MOONCAKE
 #include "kv_cache_manager/client/src/internal/sdk/mooncake_sdk.h"
 #endif
-#include "kv_cache_manager/client/src/internal/sdk/valkey_sdk.h"
 #ifdef ENABLE_TAIR_MEMPOOL
 #include "stub_source/kv_cache_manager/client/src/internal/sdk/tair_mempool_sdk.h"
 #endif

@@ -60,7 +60,11 @@ cc_library(
         "//kv_cache_manager/common:redis_client",
         "//kv_cache_manager/data_storage:common_define",
         "//kv_cache_manager/data_storage:valkey_uri_util",
-    ],
+    ] + select({
+        ":using_cuda": ["@local_config_cuda//cuda"],
+        ":using_musa": ["@local_config_musa//:musa"],
+        "//conditions:default": [],
+    }),
 )
 
 cc_library(
@@ -98,8 +102,8 @@ cc_library(
         ":enable_hf3fs": [
             "hf3fs_cuda_util.h",
             "hf3fs_gpu_util_alias.h",
-            "hf3fs_musa_util.h",
             "hf3fs_mempool.h",
+            "hf3fs_musa_util.h",
             "hf3fs_sdk.h",
             "hf3fs_usrbio_api.h",
             "hf3fs_usrbio_client.h",
@@ -215,7 +219,11 @@ cc_library(
         "musa_util.h",
         "sdk_buffer_check_util.h",
     ],
-    linkopts = ["-L/usr/local/musa/lib", "-lmusart", "-Wl,-rpath,/usr/local/musa/lib"],
+    linkopts = [
+        "-L/usr/local/musa/lib",
+        "-lmusart",
+        "-Wl,-rpath,/usr/local/musa/lib",
+    ],
     target_compatible_with = select({
         ":using_musa": [],
         "//conditions:default": ["@platforms//:incompatible"],
