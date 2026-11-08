@@ -124,6 +124,8 @@ void NfsSdkConfig::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &wri
     SdkBackendConfig::ToRapidWriter(writer);
 }
 
+ValkeySdkConfig::ValkeySdkConfig() { set_type(DataStorageType::DATA_STORAGE_TYPE_VALKEY); }
+
 bool SdkWrapperConfig::FromRapidValue(const rapidjson::Value &rapid_value) {
     KVCM_JSON_GET_MACRO(rapid_value, "thread_num", thread_num_);
     KVCM_JSON_GET_MACRO(rapid_value, "queue_size", queue_size_);
@@ -154,7 +156,7 @@ bool SdkWrapperConfig::FromRapidValue(const rapidjson::Value &rapid_value) {
                 sdk_backend_config = std::make_shared<NfsSdkConfig>();
                 break;
             case DataStorageType::DATA_STORAGE_TYPE_VALKEY:
-                sdk_backend_config = std::make_shared<SdkBackendConfig>();
+                sdk_backend_config = std::make_shared<ValkeySdkConfig>();
                 break;
             default:
                 break;
@@ -252,11 +254,11 @@ bool SdkWrapperConfig::operator==(const SdkWrapperConfig &other) const {
             equal = static_cast<const NfsSdkConfig &>(*config) == static_cast<const NfsSdkConfig &>(*other_config);
             break;
         case DataStorageType::DATA_STORAGE_TYPE_VALKEY:
-            if (typeid(*config) != typeid(SdkBackendConfig)) {
+            if (typeid(*config) != typeid(ValkeySdkConfig)) {
                 return false;
             }
             equal =
-                static_cast<const SdkBackendConfig &>(*config) == static_cast<const SdkBackendConfig &>(*other_config);
+                static_cast<const ValkeySdkConfig &>(*config) == static_cast<const ValkeySdkConfig &>(*other_config);
             break;
         default:
             return false;
@@ -301,12 +303,12 @@ std::shared_ptr<SdkBackendConfig> CloneSdkBackendConfig(const std::shared_ptr<Sd
         }
         return std::make_shared<NfsSdkConfig>(static_cast<const NfsSdkConfig &>(*source));
     case DataStorageType::DATA_STORAGE_TYPE_VALKEY:
-        // Valkey intentionally uses the base config today. Reject future
-        // subclasses until their additional state has an explicit copy path.
-        if (typeid(*source) != typeid(SdkBackendConfig)) {
+        // Reject future subclasses until their additional state has an
+        // explicit copy path.
+        if (typeid(*source) != typeid(ValkeySdkConfig)) {
             return nullptr;
         }
-        return std::make_shared<SdkBackendConfig>(*source);
+        return std::make_shared<ValkeySdkConfig>(static_cast<const ValkeySdkConfig &>(*source));
     default:
         return nullptr;
     }

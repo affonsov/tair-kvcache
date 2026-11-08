@@ -8,7 +8,7 @@
 
 namespace kv_cache_manager {
 
-enum [[nodiscard]] ClientErrorCode : int32_t{
+enum [[nodiscard]] ClientErrorCode : int32_t {
     // client & sdkwrapper
     ER_OK = 0,
     ER_INVALID_STUB = 1,
@@ -99,6 +99,7 @@ enum class StorageType : int32_t {
     ST_EVENT_REPORT_L1P5 = 7,
     ST_EVENT_REPORT_L2 = 8,
     ST_TAIRMEMPOOL_SSD = 9,
+    ST_VALKEY = 10,
 };
 
 enum class BackendSelectStrategy : int32_t {

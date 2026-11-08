@@ -314,6 +314,10 @@ void ProtoConvert::DataStorageTypeToProto(const DataStorageType &data_storage_ty
         *proto_data_storage_type = T::ST_EVENT_REPORT_L2;
         break;
     }
+    case DataStorageType::DATA_STORAGE_TYPE_VALKEY: {
+        *proto_data_storage_type = T::ST_VALKEY;
+        break;
+    }
     default: {
         // Handle unknown storage type case if necessary
         break;
@@ -368,6 +372,10 @@ void ProtoConvert::DataStorageTypeFromProto(const T proto_data_storage_type, Dat
     }
     case T::ST_EVENT_REPORT_L2: {
         data_storage_type_info = DataStorageType::DATA_STORAGE_TYPE_EVENT_REPORT_L2;
+        break;
+    }
+    case T::ST_VALKEY: {
+        data_storage_type_info = DataStorageType::DATA_STORAGE_TYPE_VALKEY;
         break;
     }
     default: {
