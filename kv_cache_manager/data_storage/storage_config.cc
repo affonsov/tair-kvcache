@@ -9,34 +9,47 @@
 namespace kv_cache_manager {
 namespace {
 
-bool IsValidValkeyEndpoint(const std::string &endpoint) {
+enum class ValkeyEndpointSecurity {
+    INVALID,
+    PLAINTEXT,
+    TLS,
+};
+
+ValkeyEndpointSecurity ClassifyValkeyEndpoint(const std::string &endpoint) {
     constexpr std::string_view kPreferredScheme = "valkey://";
     constexpr std::string_view kCompatibilityScheme = "redis://";
+    constexpr std::string_view kSecureScheme = "valkeys://";
     std::string_view scheme;
+    ValkeyEndpointSecurity security = ValkeyEndpointSecurity::INVALID;
     if (endpoint.compare(0, kPreferredScheme.size(), kPreferredScheme) == 0) {
         scheme = kPreferredScheme;
+        security = ValkeyEndpointSecurity::PLAINTEXT;
     } else if (endpoint.compare(0, kCompatibilityScheme.size(), kCompatibilityScheme) == 0) {
         scheme = kCompatibilityScheme;
+        security = ValkeyEndpointSecurity::PLAINTEXT;
+    } else if (endpoint.compare(0, kSecureScheme.size(), kSecureScheme) == 0) {
+        scheme = kSecureScheme;
+        security = ValkeyEndpointSecurity::TLS;
     } else {
-        return false;
+        return ValkeyEndpointSecurity::INVALID;
     }
 
     const std::string_view remainder(endpoint.data() + scheme.size(), endpoint.size() - scheme.size());
     const size_t slash = remainder.find('/');
     if (slash == std::string_view::npos) {
-        return false;
+        return ValkeyEndpointSecurity::INVALID;
     }
     const std::string_view authority = remainder.substr(0, slash);
     const size_t colon = authority.rfind(':');
     if (colon == std::string_view::npos || colon == 0 || colon + 1 == authority.size() ||
         authority.find(':') != colon || authority.find('@') != std::string_view::npos) {
-        return false;
+        return ValkeyEndpointSecurity::INVALID;
     }
 
     const std::string_view host = authority.substr(0, colon);
     for (const unsigned char ch : host) {
         if (!std::isalnum(ch) && ch != '.' && ch != '-' && ch != '_') {
-            return false;
+            return ValkeyEndpointSecurity::INVALID;
         }
     }
 
@@ -44,24 +57,26 @@ bool IsValidValkeyEndpoint(const std::string &endpoint) {
     const std::string_view port_string = authority.substr(colon + 1);
     const auto [port_end, port_ec] = std::from_chars(port_string.data(), port_string.data() + port_string.size(), port);
     if (port_ec != std::errc{} || port_end != port_string.data() + port_string.size() || port == 0 || port > 65535) {
-        return false;
+        return ValkeyEndpointSecurity::INVALID;
     }
 
     const std::string_view path_and_query = remainder.substr(slash);
-    if (path_and_query == "/") {
-        return true;
+    if (path_and_query != "/") {
+        constexpr std::string_view kDbPrefix = "/?db=";
+        if (path_and_query.compare(0, kDbPrefix.size(), kDbPrefix) != 0) {
+            return ValkeyEndpointSecurity::INVALID;
+        }
+        const std::string_view db_string = path_and_query.substr(kDbPrefix.size());
+        if (db_string.empty()) {
+            return ValkeyEndpointSecurity::INVALID;
+        }
+        int64_t db = 0;
+        const auto [db_end, db_ec] = std::from_chars(db_string.data(), db_string.data() + db_string.size(), db);
+        if (db_ec != std::errc{} || db_end != db_string.data() + db_string.size() || db < 0) {
+            return ValkeyEndpointSecurity::INVALID;
+        }
     }
-    constexpr std::string_view kDbPrefix = "/?db=";
-    if (path_and_query.compare(0, kDbPrefix.size(), kDbPrefix) != 0) {
-        return false;
-    }
-    const std::string_view db_string = path_and_query.substr(kDbPrefix.size());
-    if (db_string.empty()) {
-        return false;
-    }
-    int64_t db = 0;
-    const auto [db_end, db_ec] = std::from_chars(db_string.data(), db_string.data() + db_string.size(), db);
-    return db_ec == std::errc{} && db_end == db_string.data() + db_string.size() && db >= 0;
+    return security;
 }
 
 } // namespace
@@ -434,26 +449,37 @@ void DummyStorageSpec::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> 
 }
 
 bool ValkeyStorageSpec::FromRapidValue(const rapidjson::Value &rapid_value) {
-    if (!rapid_value.IsObject() || rapid_value.MemberCount() != 1 || !rapid_value.HasMember("endpoint")) {
+    if (!rapid_value.IsObject() || !rapid_value.HasMember("endpoint") || rapid_value.MemberCount() > 2 ||
+        (rapid_value.MemberCount() == 2 && !rapid_value.HasMember("security_dir"))) {
         return false;
     }
     KVCM_JSON_GET_MACRO(rapid_value, "endpoint", endpoint_);
+    KVCM_JSON_GET_DEFAULT_MACRO(rapid_value, "security_dir", security_dir_, std::string());
     return true;
 }
 
 void ValkeyStorageSpec::ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept {
     Put(writer, "endpoint", endpoint_);
+    if (!security_dir_.empty()) {
+        Put(writer, "security_dir", security_dir_);
+    }
 }
 
 bool ValkeyStorageSpec::ValidateRequiredFields(std::string &invalid_fields) const {
-    if (IsValidValkeyEndpoint(endpoint_)) {
+    const ValkeyEndpointSecurity endpoint_security = ClassifyValkeyEndpoint(endpoint_);
+    const bool absolute_security_directory =
+        !security_dir_.empty() && security_dir_.front() == '/' && security_dir_.find('\0') == std::string::npos;
+    if ((endpoint_security == ValkeyEndpointSecurity::TLS && absolute_security_directory) ||
+        (endpoint_security == ValkeyEndpointSecurity::PLAINTEXT && security_dir_.empty())) {
         return true;
     }
-    invalid_fields += "{ValkeyStorageSpec: {endpoint}}";
+    invalid_fields += "{ValkeyStorageSpec: {endpoint,security_dir}}";
     return false;
 }
 
-std::string ValkeyStorageSpec::ToString() const { return "endpoint: [redacted]"; }
+std::string ValkeyStorageSpec::ToString() const {
+    return security_dir_.empty() ? "endpoint: [redacted]" : "endpoint: [redacted], security_dir: [configured]";
+}
 
 bool StorageConfig::FromRapidValue(const rapidjson::Value &rapid_value) {
     std::string type_str;

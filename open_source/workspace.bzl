@@ -1,7 +1,7 @@
-load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive", "http_file")
 load("@bazel_tools//tools/build_defs/repo:git.bzl", "git_repository", "new_git_repository")
-load("//open_source/deps:http.bzl", "http_deps")
+load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive", "http_file")
 load("//open_source/deps:git.bzl", "git_deps")
+load("//open_source/deps:http.bzl", "http_deps")
 
 def clean_dep(dep):
     return str(Label(dep))
@@ -19,7 +19,7 @@ def kv_cache_manager_workspace():
         type = "tar.gz",
         urls = [
             "https://mirror.bazel.build/github.com/bazelbuild/bazel-skylib/releases/download/{}/bazel-skylib-{}.tar.gz".format(skylib_version, skylib_version),
-            "https://github.com/bazelbuild/bazel-skylib/releases/download/{}/bazel-skylib-{}.tar.gz".format(skylib_version, skylib_version)
+            "https://github.com/bazelbuild/bazel-skylib/releases/download/{}/bazel-skylib-{}.tar.gz".format(skylib_version, skylib_version),
         ],
     )
 
@@ -44,10 +44,10 @@ def kv_cache_manager_workspace():
     http_archive(
         name = "hiredis",
         urls = [
-            "https://github.com/redis/hiredis/archive/refs/tags/v1.3.0.tar.gz",
+            "https://github.com/redis/hiredis/archive/refs/tags/v1.5.0.tar.gz",
         ],
-        strip_prefix = "hiredis-1.3.0",
-        sha256 = "25cee4500f359cf5cad3b51ed62059aadfc0939b05150c1f19c7e2829123631c",
+        strip_prefix = "hiredis-1.5.0",
+        sha256 = "eec7ef8641d221e144a58d5ef8d733c8c75c7fd487097a233aacb4fa33981cfb",
         build_file = clean_dep("//3rdparty/hiredis:hiredis.BUILD"),
     )
 

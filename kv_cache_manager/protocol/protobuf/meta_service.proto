@@ -271,7 +271,10 @@ message NfsStorageSpec {
     int32 key_count_per_file = 2;
 }
 
-message ValkeyStorageSpec { string endpoint = 1; }
+message ValkeyStorageSpec {
+    string endpoint = 1;
+    string security_dir = 2;
+}
 
 // 允许一个meta service服务对接多种存储系统
 message StorageConfig {

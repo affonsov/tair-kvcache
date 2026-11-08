@@ -58,8 +58,8 @@ RedisClient::ReplyUPtr MakeErrorReply() {
 
 class FakeRedisClient : public RedisClient {
 public:
-    FakeRedisClient(const StandardUri &endpoint, std::shared_ptr<FakeRedisState> state)
-        : RedisClient(endpoint), state_(std::move(state)) {}
+    FakeRedisClient(const RedisConnectionOptions &options, std::shared_ptr<FakeRedisState> state)
+        : RedisClient(options), state_(std::move(state)) {}
 
 protected:
     bool IsContextOk() const override { return true; }
@@ -108,14 +108,18 @@ public:
     void set_opaque_ids(std::vector<std::string> opaque_ids) { opaque_ids_ = std::move(opaque_ids); }
     std::size_t opaque_id_calls() const { return opaque_id_calls_; }
     const std::vector<std::string> &constructed_endpoints() const { return constructed_endpoints_; }
+    const std::vector<RedisSecurityOptions> &constructed_security_options() const {
+        return constructed_security_options_;
+    }
 
 protected:
-    std::shared_ptr<RedisClient> CreateClient(const StandardUri &endpoint) override {
-        constructed_endpoints_.push_back(endpoint.ToUriString());
+    std::shared_ptr<RedisClient> CreateClient(const RedisConnectionOptions &options) override {
+        constructed_endpoints_.push_back(options.endpoint.ToUriString());
+        constructed_security_options_.push_back(options.security);
         if (fail_client_construction_) {
             return nullptr;
         }
-        return std::make_shared<FakeRedisClient>(endpoint, state_);
+        return std::make_shared<FakeRedisClient>(options, state_);
     }
 
     std::string GenerateOpaqueId() override {
@@ -133,6 +137,7 @@ private:
     std::size_t opaque_id_calls_ = 0;
     std::vector<std::string> opaque_ids_;
     std::vector<std::string> constructed_endpoints_;
+    std::vector<RedisSecurityOptions> constructed_security_options_;
 };
 
 class RealOpaqueIdValkeyBackend : public ValkeyDataStorageBackend {
@@ -151,9 +156,11 @@ protected:
 };
 
 StorageConfig MakeValkeyConfig(const std::string &identity = "valkey-primary",
-                               const std::string &endpoint = "valkey://cache.internal:6379/?db=11") {
+                               const std::string &endpoint = "valkey://cache.internal:6379/?db=11",
+                               const std::string &security_dir = "") {
     auto spec = std::make_shared<ValkeyStorageSpec>();
     spec->set_endpoint(endpoint);
+    spec->set_security_dir(security_dir);
     return StorageConfig(DataStorageType::DATA_STORAGE_TYPE_VALKEY, identity, spec);
 }
 
@@ -256,6 +263,21 @@ TEST_F(ValkeyBackendTest, InheritedOpenInitializesAndCloseClearsAvailability) {
     }
     EXPECT_EQ(EC_OK, backend.Close());
     EXPECT_FALSE(backend.Available());
+}
+
+TEST_F(ValkeyBackendTest, SecureOpenPropagatesOnlyTlsAclReferenceToEveryPoolClient) {
+    TestValkeyBackend backend(metrics_registry_, state_);
+    ASSERT_EQ(EC_OK,
+              backend.Open(MakeValkeyConfig(
+                               "valkey-primary", "valkeys://cache.internal:6379/?db=11", "/run/kvcm/valkey-security"),
+                           "trace"));
+    ASSERT_EQ(4u, backend.constructed_endpoints().size());
+    ASSERT_EQ(4u, backend.constructed_security_options().size());
+    for (std::size_t i = 0; i < backend.constructed_endpoints().size(); ++i) {
+        EXPECT_EQ("valkeys://cache.internal:6379/?db=11", backend.constructed_endpoints()[i]);
+        EXPECT_EQ(RedisTransportSecurity::TLS_NAMED_ACL, backend.constructed_security_options()[i].transport);
+        EXPECT_EQ("/run/kvcm/valkey-security", backend.constructed_security_options()[i].directory);
+    }
 }
 
 TEST_F(ValkeyBackendTest, OpenRejectsWrongConfigAndPoolInitializationFailures) {

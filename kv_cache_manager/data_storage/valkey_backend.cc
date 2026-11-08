@@ -35,9 +35,14 @@ ErrorCode ValkeyDataStorageBackend::DoOpen(const StorageConfig &storage_config, 
         return EC_BADARGS;
     }
 
-    const StandardUri endpoint = StandardUri::FromUri(spec->endpoint());
-    auto pool = std::make_unique<StaticClientPool<RedisClient>>([this, endpoint]() {
-        auto client = CreateClient(endpoint);
+    RedisConnectionOptions connection_options;
+    connection_options.endpoint = StandardUri::FromUri(spec->endpoint());
+    if (spec->secure()) {
+        connection_options.security.transport = RedisTransportSecurity::TLS_NAMED_ACL;
+        connection_options.security.directory = spec->security_dir();
+    }
+    auto pool = std::make_unique<StaticClientPool<RedisClient>>([this, connection_options]() {
+        auto client = CreateClient(connection_options);
         if (client == nullptr || !client->Open()) {
             return std::shared_ptr<RedisClient>();
         }
@@ -194,8 +199,8 @@ std::vector<ErrorCode> ValkeyDataStorageBackend::Copy(const std::vector<DataStor
     return std::vector<ErrorCode>(src_uris.size(), EC_UNIMPLEMENTED);
 }
 
-std::shared_ptr<RedisClient> ValkeyDataStorageBackend::CreateClient(const StandardUri &endpoint) {
-    return std::make_shared<RedisClient>(endpoint);
+std::shared_ptr<RedisClient> ValkeyDataStorageBackend::CreateClient(const RedisConnectionOptions &options) {
+    return std::make_shared<RedisClient>(options);
 }
 
 std::string ValkeyDataStorageBackend::GenerateOpaqueId() {

@@ -1,10 +1,16 @@
+#include <arpa/inet.h>
 #include <chrono>
 #include <future>
 #include <gtest/gtest.h>
 #include <memory>
+#include <netinet/in.h>
+#include <string>
+#include <sys/socket.h>
 #include <thread>
 #include <unistd.h>
 
+#include "kv_cache_manager/common/request_context.h"
+#include "kv_cache_manager/common/test/log_capture.h"
 #include "kv_cache_manager/common/unittest.h"
 #include "kv_cache_manager/data_storage/data_storage_manager.h"
 #include "kv_cache_manager/data_storage/dummy_backend.h"
@@ -330,6 +336,64 @@ TEST_F(DataStorageManagerTest, TestValkeyBackendIsAlwaysConstructible) {
 
     EXPECT_EQ(nullptr, data_storage_manager.CreateStorageBackend(DataStorageType::DATA_STORAGE_TYPE_UNKNOWN));
     EXPECT_EQ(nullptr, data_storage_manager.CreateStorageBackend(static_cast<DataStorageType>(255)));
+}
+
+namespace {
+
+// Loopback listener that completes TCP handshakes through its backlog but never
+// accepts or replies, so a secure client reaches its trust-material checks.
+class SilentLoopbackListener {
+public:
+    SilentLoopbackListener() {
+        fd_ = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        sockaddr_in address{};
+        address.sin_family = AF_INET;
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        socklen_t length = sizeof(address);
+        if (fd_ < 0 || bind(fd_, reinterpret_cast<sockaddr *>(&address), sizeof(address)) != 0 ||
+            listen(fd_, 64) != 0 || getsockname(fd_, reinterpret_cast<sockaddr *>(&address), &length) != 0) {
+            return;
+        }
+        port_ = ntohs(address.sin_port);
+    }
+    ~SilentLoopbackListener() {
+        if (fd_ >= 0) {
+            close(fd_);
+        }
+    }
+    SilentLoopbackListener(const SilentLoopbackListener &) = delete;
+    SilentLoopbackListener &operator=(const SilentLoopbackListener &) = delete;
+
+    int port() const { return port_; }
+
+private:
+    int fd_ = -1;
+    int port_ = 0;
+};
+
+} // namespace
+
+TEST_F(DataStorageManagerTest, TestSecureValkeyRegistrationFailureDoesNotLogEndpointOrSecurityDirectory) {
+    SilentLoopbackListener listener;
+    ASSERT_GT(listener.port(), 0);
+    const std::string endpoint = "valkeys://127.0.0.1:" + std::to_string(listener.port()) + "/?db=4";
+    const std::string security_dir = "/nonexistent/kvcm-security-dir-sentinel";
+    auto spec = std::make_shared<ValkeyStorageSpec>();
+    spec->set_endpoint(endpoint);
+    spec->set_security_dir(security_dir);
+    StorageConfig storage_config(DataStorageType::DATA_STORAGE_TYPE_VALKEY, "secure-valkey-log-test", spec);
+    RequestContext request_context("secure-valkey-log-test");
+
+    test::ScopedLogCapture capture;
+    DataStorageManager data_storage_manager(metrics_registry_);
+    EXPECT_NE(EC_OK, data_storage_manager.RegisterStorage(&request_context, "secure-valkey-log-test", storage_config));
+    const std::string &logs = capture.Stop();
+
+    EXPECT_NE(std::string::npos, logs.find("secure connection directory does not satisfy the trust policy")) << logs;
+    EXPECT_EQ(std::string::npos, logs.find(security_dir)) << logs;
+    EXPECT_EQ(std::string::npos, logs.find("kvcm-security-dir-sentinel")) << logs;
+    EXPECT_EQ(std::string::npos, logs.find(endpoint)) << logs;
+    EXPECT_EQ(std::string::npos, logs.find("valkeys://")) << logs;
 }
 
 TEST_F(DataStorageManagerTest, TestConfirmedMissingDeletePolicies) {

@@ -86,7 +86,7 @@ struct FakeRedisState {
 
 class FakeRedisClient : public RedisClient {
 public:
-    explicit FakeRedisClient(const StandardUri &endpoint) : RedisClient(endpoint) {}
+    explicit FakeRedisClient(const RedisConnectionOptions &options) : RedisClient(options) {}
 
 protected:
     bool IsContextOk() const override { return true; }
@@ -99,6 +99,7 @@ public:
 
     void set_fail_client_creation(bool value) { fail_client_creation_ = value; }
     const std::vector<std::string> &created_endpoints() const { return created_endpoints_; }
+    const std::vector<RedisSecurityOptions> &created_security_options() const { return created_security_options_; }
 
     ClientErrorCode GetWithContext(const std::vector<DataStorageUri> &remote_uris,
                                    const BlockBuffers &local_buffers,
@@ -112,12 +113,13 @@ public:
     }
 
 protected:
-    std::shared_ptr<RedisClient> CreateClient(const StandardUri &endpoint) override {
-        created_endpoints_.push_back(endpoint.ToUriString());
+    std::shared_ptr<RedisClient> CreateClient(const RedisConnectionOptions &options) override {
+        created_endpoints_.push_back(options.endpoint.ToUriString());
+        created_security_options_.push_back(options.security);
         if (fail_client_creation_) {
             return nullptr;
         }
-        return std::make_shared<FakeRedisClient>(endpoint);
+        return std::make_shared<FakeRedisClient>(options);
     }
 
     bool PrepareClient(RedisClient &) override {
@@ -209,6 +211,7 @@ private:
     std::shared_ptr<FakeRedisState> state_;
     bool fail_client_creation_ = false;
     std::vector<std::string> created_endpoints_;
+    std::vector<RedisSecurityOptions> created_security_options_;
 };
 
 class FutureValkeySdkConfig : public ValkeySdkConfig {};
@@ -223,9 +226,11 @@ std::shared_ptr<SdkBackendConfig> MakeSdkConfig(int get_timeout_ms = 2000, int p
 }
 
 std::shared_ptr<StorageConfig> MakeStorageConfig(const std::string &identity = "valkey-primary",
-                                                 const std::string &endpoint = "valkey://cache.internal:6379/?db=11") {
+                                                 const std::string &endpoint = "valkey://cache.internal:6379/?db=11",
+                                                 const std::string &security_dir = "") {
     auto spec = std::make_shared<ValkeyStorageSpec>();
     spec->set_endpoint(endpoint);
+    spec->set_security_dir(security_dir);
     return std::make_shared<StorageConfig>(DataStorageType::DATA_STORAGE_TYPE_VALKEY, identity, spec);
 }
 
@@ -368,6 +373,24 @@ TEST(ValkeySdkInitTest, ValidatesConfigsInitializesSeparateTimedPoolsAndReportsT
     }
     for (std::size_t i = 4; i < 8; ++i) {
         EXPECT_EQ("redis://cache.internal:6379/?db=11&timeout_ms=17", redis_alias.created_endpoints()[i]);
+    }
+}
+
+TEST(ValkeySdkInitTest, SecureConfigBuildsSeparateTlsAclGetAndPutPools) {
+    auto state = std::make_shared<FakeRedisState>();
+    TestValkeySdk sdk(state);
+    ASSERT_EQ(ER_OK,
+              sdk.Init(MakeSdkConfig(13, 17),
+                       MakeStorageConfig(
+                           "valkey-primary", "valkeys://cache.internal:6379/?db=11", "/run/kvcm/valkey-security")));
+    ASSERT_EQ(8u, sdk.created_endpoints().size());
+    ASSERT_EQ(8u, sdk.created_security_options().size());
+    for (std::size_t i = 0; i < 8; ++i) {
+        EXPECT_EQ(i < 4 ? "valkeys://cache.internal:6379/?db=11&timeout_ms=13"
+                        : "valkeys://cache.internal:6379/?db=11&timeout_ms=17",
+                  sdk.created_endpoints()[i]);
+        EXPECT_EQ(RedisTransportSecurity::TLS_NAMED_ACL, sdk.created_security_options()[i].transport);
+        EXPECT_EQ("/run/kvcm/valkey-security", sdk.created_security_options()[i].directory);
     }
 }
 
