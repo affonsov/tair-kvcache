@@ -276,7 +276,7 @@ std::pair<ClientErrorCode, std::string> GrpcStub::RegisterInstance(const std::st
     auto grpc_status = stub->RegisterInstance(&context, request, &response);
     CHECK_GRPC_STATUS_WITH_TYPE(grpc_status);
     CHECK_COMMON_HEADER_WITH_TYPE(response);
-    KVCM_LOG_DEBUG("register instance success, storage_config: %s", response.storage_configs().c_str());
+    KVCM_LOG_DEBUG("register instance success, storage_config_bytes: %zu", response.storage_configs().size());
     return {ER_OK, response.storage_configs()};
 }
 
@@ -505,14 +505,13 @@ GrpcStub::GetCacheLocationsByBackend(const std::string &trace_id,
     return {ER_OK, std::move(result)};
 }
 
-std::pair<ClientErrorCode, HostCacheState>
-GrpcStub::GetHostCacheState(const std::string &trace_id,
-                            const std::string &instance_id,
-                            QueryType query_type,
-                            const KeyVector &keys,
-                            const std::vector<std::string> &medium,
-                            int32_t top_k_host_count,
-                            const std::vector<StorageType> &backend_types) {
+std::pair<ClientErrorCode, HostCacheState> GrpcStub::GetHostCacheState(const std::string &trace_id,
+                                                                       const std::string &instance_id,
+                                                                       QueryType query_type,
+                                                                       const KeyVector &keys,
+                                                                       const std::vector<std::string> &medium,
+                                                                       int32_t top_k_host_count,
+                                                                       const std::vector<StorageType> &backend_types) {
     if (top_k_host_count < 0) {
         return {ER_INVALID_PARAMS, {}};
     }

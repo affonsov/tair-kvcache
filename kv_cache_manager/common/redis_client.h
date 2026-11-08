@@ -16,6 +16,21 @@
 
 namespace kv_cache_manager {
 
+enum class RedisTransportSecurity {
+    PLAINTEXT,
+    TLS_NAMED_ACL,
+};
+
+struct RedisSecurityOptions {
+    RedisTransportSecurity transport = RedisTransportSecurity::PLAINTEXT;
+    std::string directory;
+};
+
+struct RedisConnectionOptions {
+    StandardUri endpoint;
+    RedisSecurityOptions security;
+};
+
 namespace redis_client_internal {
 
 constexpr std::size_t kMaxCommandArguments = 5;
@@ -77,6 +92,7 @@ struct ValkeyGetStringsResult {
 class RedisClient {
 public:
     RedisClient(const StandardUri &storage_uri);
+    RedisClient(const RedisConnectionOptions &options);
     virtual ~RedisClient(); // virtual for test
 
     RedisClient(const RedisClient &) = delete;
@@ -187,6 +203,13 @@ protected:
     virtual redisContext *AdoptConnectedSocket(int socket_fd);
 
 private:
+    bool ConnectPlaintext();
+    // Validates security_directory_ material, reads the ACL credentials, and
+    // completes a verified TLS handshake on context_. Never falls back to plaintext.
+    bool InitiateSecureSession(std::string &username, std::string &password);
+    bool ConnectSecure();
+    bool SetSocketTimeout();
+    ReplyUPtr RunCommand(const CmdArgs &command);
     enum class StringCommand : uint8_t {
         SET,
         GET,
@@ -217,7 +240,10 @@ private:
 
     redisContext *context_ = nullptr;
     std::string user_info_;
+    std::string protocol_;
     std::string host_;
+    std::string security_directory_;
+    RedisTransportSecurity transport_security_ = RedisTransportSecurity::PLAINTEXT;
     std::vector<NumericAddress> numeric_addresses_;
     bool prepared_ = false;
     int64_t port_ = 0;

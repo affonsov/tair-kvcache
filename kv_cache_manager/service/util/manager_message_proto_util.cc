@@ -76,7 +76,9 @@ void ProtoConvert::StorageConfigToProto(const StorageConfig &storage_config,
             KVCM_LOG_WARN("valkey storage [%s] has no Valkey storage spec; omitting spec fields",
                           storage_config.global_unique_name().c_str());
         } else {
-            proto_storage_config->mutable_valkey()->set_endpoint(valkey_storage->endpoint());
+            auto *proto_valkey = proto_storage_config->mutable_valkey();
+            proto_valkey->set_endpoint(valkey_storage->endpoint());
+            proto_valkey->set_security_dir(valkey_storage->security_dir());
         }
     } else if (IsEventReportStorageType(type)) {
         const auto &er_spec = *std::dynamic_pointer_cast<EventReportStorageSpec>(storage_config.storage_spec());
@@ -186,6 +188,7 @@ void ProtoConvert::StorageFromProto(const proto::admin::StorageConfig *proto_sto
     case proto::admin::StorageConfig::kValkey: {
         ValkeyStorageSpec spec;
         spec.set_endpoint(proto_storage_config->valkey().endpoint());
+        spec.set_security_dir(proto_storage_config->valkey().security_dir());
         storage_config.set_storage_spec(std::make_shared<ValkeyStorageSpec>(spec));
         storage_config.set_type(DataStorageType::DATA_STORAGE_TYPE_VALKEY);
         break;

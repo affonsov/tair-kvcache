@@ -74,13 +74,17 @@ cc_test(
 cc_test(
     name = "valkey_transfer_client_real_service_test",
     srcs = ["valkey_transfer_client_real_service_test.cc"],
+    # CI selects manual live tests tagged "redis". Plaintext cases start their own
+    # unauthenticated loopback valkey-server and secure cases start a TLS/ACL one,
+    # both from PATH (provided by the CI image).
     tags = [
         "manual",
-        "valkey",
+        "redis",
     ],
     deps = [
         "//kv_cache_manager/client",
         "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/common/test:secure_valkey_test_environment",
         "//kv_cache_manager/data_storage",
         "//kv_cache_manager/metrics:metrics_registry",
         "//kv_cache_manager/protocol/protobuf:service_cc_proto",

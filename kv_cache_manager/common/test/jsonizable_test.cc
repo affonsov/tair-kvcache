@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include <memory>
 
 #include "kv_cache_manager/common/jsonizable.h"
 #include "kv_cache_manager/common/unittest.h"
@@ -7,6 +8,28 @@ namespace kv_cache_manager {
 
 class JsonizableTest : public TESTBASE {
 public:
+};
+
+class JsonizableLoggingTest : public JsonizableTest {
+public:
+    void SetUp() override {
+        previous_log_level_ = LoggerBroker::base_log_level_;
+        console_env_ = std::make_unique<ScopedEnv>("KVCM_LOG_TO_CONSOLE", "1");
+        LoggerBroker::DestroyLogger();
+        ASSERT_TRUE(LoggerBroker::InitLogger(""));
+        LoggerBroker::SetLogLevel(Logger::LEVEL_WARN);
+    }
+
+    void TearDown() override {
+        LoggerBroker::DestroyLogger();
+        console_env_.reset();
+        LoggerBroker::InitLogger("");
+        LoggerBroker::SetLogLevel(previous_log_level_);
+    }
+
+private:
+    uint32_t previous_log_level_ = Logger::LEVEL_DEBUG;
+    std::unique_ptr<ScopedEnv> console_env_;
 };
 
 enum class EnumClass {
@@ -147,6 +170,24 @@ TEST_F(JsonizableTest, TestParseError) {
     )";
     JsonClass json_objct;
     ASSERT_FALSE(json_objct.FromJsonString(json_str));
+}
+
+TEST_F(JsonizableLoggingTest, ParseErrorLogDoesNotExposeInput) {
+    const std::string endpoint_sentinel = "malformed-endpoint-sentinel.invalid";
+    const std::string directory_sentinel = "/malformed/directory/sentinel";
+    const std::string malformed_json =
+        "{\"endpoint\":\"" + endpoint_sentinel + "\",\"security_dir\":\"" + directory_sentinel + "\",}";
+
+    testing::internal::CaptureStdout();
+    JsonClass json_object;
+    EXPECT_FALSE(json_object.FromJsonString(malformed_json));
+    const std::string logs = testing::internal::GetCapturedStdout();
+
+    EXPECT_THAT(logs, Not(HasSubstr(endpoint_sentinel)));
+    EXPECT_THAT(logs, Not(HasSubstr(directory_sentinel)));
+    EXPECT_THAT(logs, HasSubstr("parse error code ["));
+    EXPECT_THAT(logs, HasSubstr("offset ["));
+    EXPECT_THAT(logs, HasSubstr("input bytes [" + std::to_string(malformed_json.size()) + "]"));
 }
 
 TEST_F(JsonizableTest, TestFromJsonErrorType) {
