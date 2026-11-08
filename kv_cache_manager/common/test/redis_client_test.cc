@@ -1,3 +1,8 @@
+#include <algorithm>
+#include <cstddef>
+#include <string>
+#include <vector>
+
 #include "kv_cache_manager/common/redis_client.h"
 #include "kv_cache_manager/common/test/mock_redis_client.h"
 #include "kv_cache_manager/common/test/redis_test_base.h"
@@ -199,6 +204,17 @@ TEST_F(RedisClientTest, TestSet) {
         auto ec_per_key = redis_client_->Set(keys, field_maps);
         ASSERT_EQ(std::vector<ErrorCode>(keys.size(), EC_ERROR), ec_per_key);
     }
+}
+
+TEST_F(RedisClientTest, TestStringCommandsBadArgumentsAndEmptyInputDoNoIo) {
+    EXPECT_CALL(*redis_client_, TryExecPipeline(_)).Times(0);
+
+    ASSERT_EQ(std::vector<ErrorCode>(2, EC_BADARGS), redis_client_->SetStrings({"key1", "key2"}, {"value1"}));
+    ASSERT_TRUE(redis_client_->SetStrings({}, {}).empty());
+
+    std::vector<std::string> out_values{"stale"};
+    ASSERT_TRUE(redis_client_->GetStrings({}, out_values).empty());
+    ASSERT_TRUE(out_values.empty());
 }
 
 TEST_F(RedisClientTest, TestUpdate) {
@@ -716,7 +732,10 @@ TEST_F(RedisClientTest, TestKeysAndFieldsWithSpaces) {
         std::vector<std::map<std::string, std::string>> field_maps;
         std::vector<std::map<std::string, std::string>> expected_field_maps{
             {{"field with spaces", "value with spaces"}, {"another field", "another value"}}};
-        auto ec_per_key = redis_client_->Get(keys, /*field_names*/ std::vector<std::string>{"field with spaces", "another field"}, field_maps);
+        auto ec_per_key =
+            redis_client_->Get(keys,
+                               /*field_names*/ std::vector<std::string>{"field with spaces", "another field"},
+                               field_maps);
         ASSERT_EQ(std::vector<ErrorCode>(keys.size(), EC_OK), ec_per_key);
         ASSERT_EQ(expected_field_maps, field_maps);
     }
@@ -842,7 +861,7 @@ TEST_F(RedisClientTest, TestBuildHashSetCmds) {
     std::vector<std::string> keys = {"k1", "k2", "k3"};
     std::vector<std::map<std::string, std::string>> field_maps = {
         {{"a", "1"}},
-        {},           // empty - should be skipped
+        {}, // empty - should be skipped
         {{"b", "2"}, {"c", "3"}},
     };
     std::vector<CmdArgs> cmds;
@@ -885,7 +904,7 @@ TEST_F(RedisClientTest, TestBuildHashDeleteCmds) {
     std::vector<std::string> keys = {"k1", "k2", "k3"};
     std::vector<std::vector<std::string>> field_names_vec = {
         {"f1", "f2"},
-        {},         // empty - should be skipped
+        {}, // empty - should be skipped
         {"f3"},
     };
     std::vector<CmdArgs> cmds;
