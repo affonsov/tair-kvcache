@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <sstream>
+#include <typeinfo>
 
 #include "kv_cache_manager/common/logger.h"
 
@@ -152,6 +153,9 @@ bool SdkWrapperConfig::FromRapidValue(const rapidjson::Value &rapid_value) {
             case DataStorageType::DATA_STORAGE_TYPE_NFS:
                 sdk_backend_config = std::make_shared<NfsSdkConfig>();
                 break;
+            case DataStorageType::DATA_STORAGE_TYPE_VALKEY:
+                sdk_backend_config = std::make_shared<SdkBackendConfig>();
+                break;
             default:
                 break;
             }
@@ -197,25 +201,67 @@ std::shared_ptr<SdkBackendConfig> SdkWrapperConfig::GetSdkBackendConfig(DataStor
 }
 
 bool SdkWrapperConfig::operator==(const SdkWrapperConfig &other) const {
-    // Compare the maps by checking each entry
     if (sdk_backend_configs_map_.size() != other.sdk_backend_configs_map_.size()) {
         return false;
     }
 
-    for (const auto &pair : sdk_backend_configs_map_) {
-        auto it = other.sdk_backend_configs_map_.find(pair.first);
-        if (it == other.sdk_backend_configs_map_.end()) {
+    for (const auto &[type, config] : sdk_backend_configs_map_) {
+        const auto other_it = other.sdk_backend_configs_map_.find(type);
+        if (other_it == other.sdk_backend_configs_map_.end()) {
+            return false;
+        }
+        const auto &other_config = other_it->second;
+        if (!config || !other_config) {
+            if (config != other_config) {
+                return false;
+            }
+            continue;
+        }
+        if (typeid(*config) != typeid(*other_config) || config->type() != type || other_config->type() != type) {
             return false;
         }
 
-        // We need to compare the actual config objects
-        // Since they're stored as shared_ptr<SdkBackendConfig>, we need to downcast and compare
-        // For simplicity, we'll just compare the JSON representations
-        if (pair.second && it->second) {
-            if (pair.second->ToJsonString() != it->second->ToJsonString()) {
+        bool equal = false;
+        switch (type) {
+        case DataStorageType::DATA_STORAGE_TYPE_HF3FS:
+        case DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS:
+            if (typeid(*config) != typeid(Hf3fsSdkConfig)) {
                 return false;
             }
-        } else if (pair.second || it->second) {
+            equal = static_cast<const Hf3fsSdkConfig &>(*config) == static_cast<const Hf3fsSdkConfig &>(*other_config);
+            break;
+        case DataStorageType::DATA_STORAGE_TYPE_MOONCAKE:
+            if (typeid(*config) != typeid(MooncakeSdkConfig)) {
+                return false;
+            }
+            equal = static_cast<const MooncakeSdkConfig &>(*config) ==
+                    static_cast<const MooncakeSdkConfig &>(*other_config);
+            break;
+        case DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL:
+        case DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD:
+            if (typeid(*config) != typeid(TairMempoolSdkConfig)) {
+                return false;
+            }
+            equal = static_cast<const TairMempoolSdkConfig &>(*config) ==
+                    static_cast<const TairMempoolSdkConfig &>(*other_config);
+            break;
+        case DataStorageType::DATA_STORAGE_TYPE_NFS:
+            if (typeid(*config) != typeid(NfsSdkConfig)) {
+                return false;
+            }
+            equal = static_cast<const NfsSdkConfig &>(*config) == static_cast<const NfsSdkConfig &>(*other_config);
+            break;
+        case DataStorageType::DATA_STORAGE_TYPE_VALKEY:
+            if (typeid(*config) != typeid(SdkBackendConfig)) {
+                return false;
+            }
+            equal =
+                static_cast<const SdkBackendConfig &>(*config) == static_cast<const SdkBackendConfig &>(*other_config);
+            break;
+        default:
+            return false;
+        }
+        if (!equal) {
             return false;
         }
     }
@@ -225,5 +271,70 @@ bool SdkWrapperConfig::operator==(const SdkWrapperConfig &other) const {
 }
 
 bool SdkWrapperConfig::operator!=(const SdkWrapperConfig &other) const { return !(*this == other); }
+
+std::shared_ptr<SdkBackendConfig> CloneSdkBackendConfig(const std::shared_ptr<SdkBackendConfig> &source) {
+    if (!source) {
+        return nullptr;
+    }
+
+    switch (source->type()) {
+    case DataStorageType::DATA_STORAGE_TYPE_HF3FS:
+    case DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS:
+        if (typeid(*source) != typeid(Hf3fsSdkConfig)) {
+            return nullptr;
+        }
+        return std::make_shared<Hf3fsSdkConfig>(static_cast<const Hf3fsSdkConfig &>(*source));
+    case DataStorageType::DATA_STORAGE_TYPE_MOONCAKE:
+        if (typeid(*source) != typeid(MooncakeSdkConfig)) {
+            return nullptr;
+        }
+        return std::make_shared<MooncakeSdkConfig>(static_cast<const MooncakeSdkConfig &>(*source));
+    case DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL:
+    case DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD:
+        if (typeid(*source) != typeid(TairMempoolSdkConfig)) {
+            return nullptr;
+        }
+        return std::make_shared<TairMempoolSdkConfig>(static_cast<const TairMempoolSdkConfig &>(*source));
+    case DataStorageType::DATA_STORAGE_TYPE_NFS:
+        if (typeid(*source) != typeid(NfsSdkConfig)) {
+            return nullptr;
+        }
+        return std::make_shared<NfsSdkConfig>(static_cast<const NfsSdkConfig &>(*source));
+    case DataStorageType::DATA_STORAGE_TYPE_VALKEY:
+        // Valkey intentionally uses the base config today. Reject future
+        // subclasses until their additional state has an explicit copy path.
+        if (typeid(*source) != typeid(SdkBackendConfig)) {
+            return nullptr;
+        }
+        return std::make_shared<SdkBackendConfig>(*source);
+    default:
+        return nullptr;
+    }
+}
+
+std::shared_ptr<SdkWrapperConfig> CloneSdkWrapperConfig(const std::shared_ptr<SdkWrapperConfig> &source) {
+    if (!source) {
+        return nullptr;
+    }
+
+    auto clone = std::make_shared<SdkWrapperConfig>();
+    clone->set_thread_num(source->thread_num());
+    clone->set_queue_size(source->queue_size());
+    clone->set_timeout_config(source->timeout_config());
+    std::unordered_map<DataStorageType, std::shared_ptr<SdkBackendConfig>> backend_configs;
+    backend_configs.reserve(source->sdk_backend_configs_map().size());
+    for (const auto &[type, backend_config] : source->sdk_backend_configs_map()) {
+        if (!backend_config || backend_config->type() != type) {
+            return nullptr;
+        }
+        auto backend_clone = CloneSdkBackendConfig(backend_config);
+        if (!backend_clone) {
+            return nullptr;
+        }
+        backend_configs.emplace(type, std::move(backend_clone));
+    }
+    clone->set_sdk_backend_configs_map(backend_configs);
+    return clone;
+}
 
 } // namespace kv_cache_manager

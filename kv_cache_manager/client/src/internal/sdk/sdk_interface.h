@@ -1,7 +1,15 @@
 #pragma once
 
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <cstddef>
+#include <cstdint>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <unordered_map>
+#include <utility>
 
 #include "kv_cache_manager/client/include/common.h"
 #include "kv_cache_manager/client/src/internal/config/sdk_config.h"
@@ -11,14 +19,111 @@
 
 namespace kv_cache_manager {
 
-// 各存储后端 SDK 的统一接口。
-// 超时契约（静态，无调用参数）：SdkWrapper 在 Init 阶段把自身配置的静态预算注入
-// SdkBackendConfig::timeout_config()（get/put_timeout_ms）。后端从自身任务起点
-// 起算 deadline，在预算内完成或内部取消；到点后不得再触碰 caller 的 local
-// buffers。能做到的（localfile/hf3fs）须如实做到，做不到的（mooncake，上游无
-// 取消语义）须声明 soft 并输出可归因日志。不读取该字段的后端（tair_mempool）
-// 自行管理内部超时，要求其内部超时严格小于 wrapper 预算。
-// 规范全文见 docs/design/client_sdk_io_contract.md。
+// Per-call state shared by SdkWrapper and contextual SDK implementations. Child
+// contexts share the deadline, cancellation, and caller-memory synchronization,
+// but each child publishes its own output-commit result.
+class SdkCallContext {
+private:
+    struct SharedState;
+    struct OutputCommitState;
+
+public:
+    using Deadline = std::chrono::steady_clock::time_point;
+
+    class CallerMemoryGuard {
+    public:
+        CallerMemoryGuard(const CallerMemoryGuard &) = delete;
+        CallerMemoryGuard &operator=(const CallerMemoryGuard &) = delete;
+        CallerMemoryGuard(CallerMemoryGuard &&other) noexcept
+            : shared_state_(std::move(other.shared_state_))
+            , output_commit_state_(std::move(other.output_commit_state_)) {}
+        CallerMemoryGuard &operator=(CallerMemoryGuard &&other) noexcept {
+            if (this != &other) {
+                Release();
+                shared_state_ = std::move(other.shared_state_);
+                output_commit_state_ = std::move(other.output_commit_state_);
+            }
+            return *this;
+        }
+        ~CallerMemoryGuard() { Release(); }
+
+        // Publish the result only after all caller-visible writes covered by
+        // this output guard are complete. Destruction without Complete() leaves
+        // the commit admitted but incomplete.
+        void Complete(ClientErrorCode result);
+
+    private:
+        friend class SdkCallContext;
+        CallerMemoryGuard(std::shared_ptr<SharedState> shared_state,
+                          std::shared_ptr<OutputCommitState> output_commit_state)
+            : shared_state_(std::move(shared_state)), output_commit_state_(std::move(output_commit_state)) {}
+        void Release();
+
+        std::shared_ptr<SharedState> shared_state_;
+        std::shared_ptr<OutputCommitState> output_commit_state_;
+    };
+
+    enum class AccessKind {
+        SOURCE_READ,
+        OUTPUT_COMMIT,
+    };
+
+    explicit SdkCallContext(Deadline deadline);
+
+    Deadline deadline() const;
+    bool IsLive() const;
+    SdkCallContext MakeTaskContext() const;
+    bool HasAdmittedOutputCommit() const;
+    std::optional<ClientErrorCode> CompletedOutputCommit() const;
+    std::optional<CallerMemoryGuard> TryAcquireCallerMemory(AccessKind kind = AccessKind::SOURCE_READ) const;
+
+    // Cancellation is published separately so callers can stop new access
+    // before bounded future draining, then synchronize admitted access.
+    void Cancel() const;
+    void WaitForCallerMemory() const;
+    void CancelAndWait() const;
+
+private:
+    SdkCallContext(std::shared_ptr<SharedState> shared_state, std::shared_ptr<OutputCommitState> output_commit_state);
+
+    struct SharedState {
+        explicit SharedState(Deadline value) : deadline(value) {}
+
+        const Deadline deadline;
+        std::atomic<bool> cancelled{false};
+        std::mutex mutex;
+        std::condition_variable cv;
+        std::size_t active_callers = 0;
+    };
+
+    enum class OutputCommitPhase : std::uint32_t {
+        NOT_ADMITTED,
+        ADMITTED,
+        COMPLETED,
+    };
+
+    struct OutputCommitState {
+        static constexpr std::uint64_t Encode(OutputCommitPhase phase, ClientErrorCode result = ER_TASK_CANCELLED) {
+            return (static_cast<std::uint64_t>(static_cast<std::uint32_t>(static_cast<std::int32_t>(result))) << 32) |
+                   static_cast<std::uint32_t>(phase);
+        }
+
+        static constexpr OutputCommitPhase Phase(std::uint64_t value) {
+            return static_cast<OutputCommitPhase>(static_cast<std::uint32_t>(value));
+        }
+
+        static constexpr ClientErrorCode Result(std::uint64_t value) {
+            return static_cast<ClientErrorCode>(static_cast<std::int32_t>(value >> 32));
+        }
+
+        std::atomic<std::uint64_t> value{Encode(OutputCommitPhase::NOT_ADMITTED)};
+    };
+
+    std::shared_ptr<SharedState> shared_state_;
+    std::shared_ptr<OutputCommitState> output_commit_state_;
+};
+
+// Existing storage SDK ABI. Keep the virtual method order unchanged.
 class SdkInterface {
 public:
     SdkInterface() {}
@@ -52,6 +157,26 @@ protected:
     using GroupMap = std::unordered_map<std::string, BlockGroup>;
     // 按 path 分组，并记录每个元素在原始入参中的下标到 BlockGroup::indices。
     GroupMap SplitByPath(const std::vector<DataStorageUri> &remote_uris, const BlockBuffers &local_buffers);
+};
+
+// Optional contextual API. SdkWrapper discovers it with dynamic_cast and uses
+// the unchanged SdkInterface methods for legacy implementations.
+//
+// Buffer-safety contract: implementations access caller buffers only while
+// holding a guard from SdkCallContext::TryAcquireCallerMemory(), and leave no
+// asynchronous access running once that guard is released. SdkWrapper relies
+// on this to report ER_SDK_TIMEOUT_BUFFER_SAFE / ER_SDK_ERROR_BUFFER_SAFE for
+// contextual tasks after cancellation and WaitForCallerMemory().
+class ContextualSdkInterface {
+public:
+    virtual ~ContextualSdkInterface() = default;
+    virtual ClientErrorCode GetWithContext(const std::vector<DataStorageUri> &remote_uris,
+                                           const BlockBuffers &local_buffers,
+                                           const SdkCallContext &context) = 0;
+    virtual ClientErrorCode PutWithContext(const std::vector<DataStorageUri> &remote_uris,
+                                           const BlockBuffers &local_buffers,
+                                           std::shared_ptr<std::vector<DataStorageUri>> actual_remote_uris,
+                                           const SdkCallContext &context) = 0;
 };
 
 } // namespace kv_cache_manager
