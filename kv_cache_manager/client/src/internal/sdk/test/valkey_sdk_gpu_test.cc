@@ -219,8 +219,7 @@ private:
 };
 
 std::shared_ptr<SdkBackendConfig> MakeSdkConfig() {
-    auto config = std::make_shared<SdkBackendConfig>();
-    config->set_type(DataStorageType::DATA_STORAGE_TYPE_VALKEY);
+    auto config = std::make_shared<ValkeySdkConfig>();
     SdkTimeoutConfig timeout;
     timeout.set_get_timeout_ms(2000);
     timeout.set_put_timeout_ms(2000);

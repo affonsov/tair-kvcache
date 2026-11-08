@@ -3,7 +3,7 @@ from pathlib import Path
 import sys
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 # Bazel keeps sources under package/kvcm_ops while the wheel exposes kvcm_ops
 # as a top-level namespace package.
@@ -13,13 +13,16 @@ from kvcm_ops.kvcm.storage.util import (
     add_event_report_sub_parser,
     add_pace_sub_parser,
     add_pace_ssd_sub_parser,
+    add_valkey_sub_parser,
+    add_or_update_main,
     gen_event_report_config_data,
     gen_pace_config_data,
+    gen_valkey_config_data,
     get_pace_storage_type,
 )
 from kvcm_ops.kvcm.storage import add_storage, update_storage
 from kvcm_ops.kvcm.storage.update_storage import create_update_storage_data
-from kvcm_ops.kvcm.instance_group.util import CacheConfig
+from kvcm_ops.kvcm.instance_group.util import CacheConfig, StorageQuota, split_storage_quotas_value
 
 
 class EventReportStorageArgsTest(unittest.TestCase):
@@ -372,6 +375,214 @@ class PaceServiceDiscoveryCliTest(unittest.TestCase):
                         self.assertEqual(2, spec["health_check_timeout"])
                         self.assertTrue(spec["skip_confirmed_missing_backend_delete"])
                         self.assertEqual(previous, existing_spec.get("service_discovery_url"))
+
+
+class ValkeyStorageQuotaTest(unittest.TestCase):
+    def test_valkey_quota_is_accepted_and_normalized(self):
+        quota = StorageQuota("st_valkey", 4096)
+        self.assertEqual(
+            {"storage_type": "ST_VALKEY", "capacity": 4096},
+            quota.to_json_data(),
+        )
+        parsed = split_storage_quotas_value("ST_NFS,1;st_valkey,2")
+        self.assertEqual("ST_VALKEY", parsed[1].to_json_data()["storage_type"])
+
+    def test_unknown_and_nonpositive_valkey_quotas_are_rejected(self):
+        with self.assertRaisesRegex(RuntimeError, "storage type ST_UNKNOWN invalid"):
+            StorageQuota("ST_UNKNOWN", 1)
+        with self.assertRaisesRegex(RuntimeError, "capacity 0 <= 0"):
+            StorageQuota("ST_VALKEY", 0)
+
+
+class ValkeyStorageCliTest(unittest.TestCase):
+    endpoint = "valkey://127.0.0.1:6380/?db=12"
+
+    @staticmethod
+    def _parse_args(*args):
+        parser = argparse.ArgumentParser()
+        subparsers = parser.add_subparsers(dest="storage_type", required=True)
+        add_valkey_sub_parser(subparsers)
+        return parser.parse_args(["valkey", *args])
+
+    def test_parser_requires_endpoint_and_preserves_it(self):
+        with self.assertRaises(SystemExit):
+            self._parse_args()
+        args = self._parse_args("--endpoint", self.endpoint)
+        self.assertEqual(self.endpoint, args.endpoint)
+        self.assertEqual({"endpoint": self.endpoint}, gen_valkey_config_data(args))
+
+    def test_parser_accepts_redis_alias_and_database_forms_unchanged(self):
+        endpoints = (
+            "redis://cache_host-1.example:1/",
+            "valkey://127.0.0.1:65535/?db=0",
+            "redis://cache:6379/?db=9223372036854775807",
+        )
+        for endpoint in endpoints:
+            with self.subTest(endpoint=endpoint):
+                self.assertEqual(endpoint, self._parse_args("--endpoint", endpoint).endpoint)
+
+    def test_parser_rejects_malformed_endpoints(self):
+        endpoints = (
+            "http://localhost:6379/",
+            "VALKEY://localhost:6379/",
+            "valkey://:6379/",
+            "valkey://local host:6379/",
+            "valkey://localhost/",
+            "valkey://localhost:0/",
+            "valkey://localhost:65536/",
+            "valkey://localhost:+6379/",
+            "valkey://localhost:port/",
+            "valkey://localhost:6379",
+            "valkey://localhost:6379/path",
+            "valkey://localhost:6379/?db=",
+            "valkey://localhost:6379/?db=-1",
+            "valkey://localhost:6379/?db=+1",
+            "valkey://localhost:6379/?db=9223372036854775808",
+            "valkey://localhost:6379/?db=1&timeout=1",
+            "valkey://localhost:6379/#fragment",
+        )
+        for endpoint in endpoints:
+            with self.subTest(endpoint=endpoint), self.assertRaises(SystemExit):
+                self._parse_args("--endpoint", endpoint)
+
+    def test_secret_bearing_endpoint_is_rejected_before_http_dispatch(self):
+        endpoint = "valkey://user:never-log-this@localhost:6379/"
+        for module in (add_storage, update_storage):
+            with self.subTest(module=module.__name__), patch.object(module, "http_post_and_print") as mock_post:
+                argv = [module.__name__, "-u", "valkey_primary", "valkey", "--endpoint", endpoint]
+                with patch.object(sys, "argv", argv), patch("sys.stderr") as mock_stderr:
+                    with self.assertRaises(SystemExit):
+                        module.main()
+                mock_post.assert_not_called()
+                stderr_text = "".join(call.args[0] for call in mock_stderr.write.call_args_list)
+                self.assertNotIn("never-log-this", stderr_text)
+
+    def test_existing_add_or_update_caller_needs_no_valkey_callback(self):
+        handlers = [Mock() for _ in range(4)]
+        argv = ["add_storage", "-u", "nfs_primary", "nfs", "--root_path", "/tmp/nfs", "--key_count_per_file", "1"]
+        with patch.object(sys, "argv", argv):
+            add_or_update_main("add_storage", *handlers)
+        handlers[0].assert_called_once()
+
+    def test_add_payload_uses_valkey_spec_and_explicit_type(self):
+        args = argparse.Namespace(
+            unique_name="valkey_primary",
+            trace_id="trace",
+        )
+        payload = add_storage.create_add_storage_data(
+            args,
+            "valkey",
+            {"endpoint": self.endpoint},
+        )
+        self.assertEqual(
+            {
+                "trace_id": "trace",
+                "storage": {
+                    "global_unique_name": "valkey_primary",
+                    "valkey": {"endpoint": self.endpoint},
+                    "check_storage_available_when_open": True,
+                    "storage_type": "ST_VALKEY",
+                },
+            },
+            payload,
+        )
+
+    @patch.object(add_storage, "http_post_and_print")
+    def test_add_subcommand_dispatches_exact_endpoint(self, mock_post):
+        argv = [
+            "add_storage",
+            "-u",
+            "valkey_primary",
+            "valkey",
+            "--endpoint",
+            self.endpoint,
+        ]
+        with patch.object(sys, "argv", argv):
+            add_storage.main()
+        storage = mock_post.call_args.args[1]["storage"]
+        self.assertEqual("ST_VALKEY", storage["storage_type"])
+        self.assertEqual({"endpoint": self.endpoint}, storage["valkey"])
+
+    @staticmethod
+    def _list_response(storage_type, spec_field="valkey", name="valkey_primary"):
+        return {
+            "header": {"status": {"code": "OK"}},
+            "storage": [
+                {"global_unique_name": "other", "storage_type": "ST_NFS", "nfs": {}},
+                {"global_unique_name": name, "storage_type": storage_type, spec_field: {}},
+            ],
+        }
+
+    @patch.object(update_storage, "http_post_and_print")
+    @patch.object(update_storage, "http_post")
+    def test_update_subcommand_uses_same_coherent_payload(self, mock_http_post, mock_post):
+        mock_http_post.return_value = self._list_response("ST_VALKEY")
+        argv = [
+            "update_storage",
+            "-u",
+            "valkey_primary",
+            "valkey",
+            "--endpoint",
+            self.endpoint,
+        ]
+        with patch.object(sys, "argv", argv):
+            update_storage.main()
+        self.assertEqual("/api/listStorage", mock_http_post.call_args.args[1])
+        storage = mock_post.call_args.args[1]["storage"]
+        self.assertEqual("ST_VALKEY", storage["storage_type"])
+        self.assertEqual({"endpoint": self.endpoint}, storage["valkey"])
+
+    @patch.object(update_storage, "http_post_and_print")
+    @patch.object(update_storage, "http_post")
+    def test_update_accepts_numeric_valkey_storage_type(self, mock_http_post, mock_post):
+        mock_http_post.return_value = self._list_response(10)
+        args = argparse.Namespace(
+            host="localhost", trace_id="trace", unique_name="valkey_primary",
+            verbose=False, endpoint=self.endpoint)
+        update_storage.handle_valkey(args)
+        self.assertEqual("ST_VALKEY", mock_post.call_args.args[1]["storage"]["storage_type"])
+
+    @patch.object(update_storage, "http_post_and_print")
+    @patch.object(update_storage, "http_post")
+    def test_update_refuses_to_change_existing_storage_type(self, mock_http_post, mock_post):
+        args = argparse.Namespace(
+            host="localhost", trace_id="trace", unique_name="valkey_primary",
+            verbose=False, endpoint=self.endpoint)
+        cases = (
+            (self._list_response("ST_NFS", spec_field="nfs"), "storage_type ST_NFS"),
+            (self._list_response("ST_UNSPECIFIED", spec_field="nfs"), "storage_type ST_UNSPECIFIED"),
+            (self._list_response("ST_VALKEY", name="another"), "does not exist"),
+            ({"header": {"status": {"code": "INTERNAL_ERROR"}}}, "list storage failed"),
+        )
+        for response, message in cases:
+            with self.subTest(message=message):
+                mock_http_post.return_value = response
+                with self.assertRaisesRegex(RuntimeError, message):
+                    update_storage.handle_valkey(args)
+        mock_post.assert_not_called()
+
+    @patch.object(add_storage, "pretty_print_json")
+    @patch.object(add_storage, "http_post")
+    def test_add_http_handler_posts_payload_without_changing_endpoint(
+        self, mock_http_post, mock_pretty_print
+    ):
+        payload = {
+            "trace_id": "trace",
+            "storage": {
+                "storage_type": "ST_VALKEY",
+                "valkey": {"endpoint": self.endpoint},
+            },
+        }
+        response = {"header": {"status": {"code": "OK"}}}
+        mock_http_post.return_value = response
+
+        add_storage.http_post_and_print("http://manager", payload, False)
+
+        mock_http_post.assert_called_once_with(
+            "http://manager", "/api/addStorage", payload, False
+        )
+        mock_pretty_print.assert_called_once_with(response)
+        self.assertEqual(self.endpoint, payload["storage"]["valkey"]["endpoint"])
 
 
 class TairMempoolSsdPreferenceTest(unittest.TestCase):

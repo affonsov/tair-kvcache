@@ -46,6 +46,7 @@ cc_library(
         "//kv_cache_manager/common/hash",  # for xxph3
         ":common_define",
         ":snapshot_uri_utils",
+        ":valkey_backend",
         # Internal implementations
         "//stub_source/kv_cache_manager/data_storage:tair_mempool",
     ] + select({

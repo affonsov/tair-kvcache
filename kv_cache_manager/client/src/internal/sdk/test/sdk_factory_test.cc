@@ -2,9 +2,20 @@
 #include <typeinfo>
 
 #include "kv_cache_manager/client/src/internal/sdk/sdk_factory.h"
+#include "kv_cache_manager/client/src/internal/sdk/valkey_sdk.h"
 #include "kv_cache_manager/common/unittest.h"
 
 using namespace kv_cache_manager;
+
+TEST(SdkFactoryTest, ValkeyCreatesValkeySdk) {
+    const auto sdk = SdkFactory::CreateSdkInstance(DataStorageType::DATA_STORAGE_TYPE_VALKEY);
+
+    ASSERT_NE(nullptr, sdk);
+    EXPECT_NE(nullptr, std::dynamic_pointer_cast<ValkeySdk>(sdk));
+    EXPECT_EQ(SdkType::VALKEY, sdk->Type());
+    EXPECT_EQ(nullptr, SdkFactory::CreateSdkInstance(DataStorageType::DATA_STORAGE_TYPE_UNKNOWN));
+    EXPECT_EQ(nullptr, SdkFactory::CreateSdkInstance(static_cast<DataStorageType>(255)));
+}
 
 TEST(SdkFactoryTest, TairMempoolDramAndSsdCreateSameSdkType) {
 #ifdef ENABLE_TAIR_MEMPOOL
