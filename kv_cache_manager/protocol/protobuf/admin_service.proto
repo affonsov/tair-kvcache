@@ -48,6 +48,7 @@ enum StorageType {
     ST_EVENT_REPORT_L1P5 = 7;
     ST_EVENT_REPORT_L2 = 8;
     ST_TAIRMEMPOOL_SSD = 9;
+    ST_VALKEY = 10;
 }
 
 enum QueryType {
@@ -122,6 +123,8 @@ message NfsStorageSpec {
     int32 key_count_per_file = 2;
 }
 
+message ValkeyStorageSpec { string endpoint = 1; }
+
 message EventReportStorageSpec {
     int64 heartbeat_timeout_ms = 1;
     int64 cleanup_grace_ms = 2;
@@ -143,6 +146,7 @@ message StorageConfig {
         VcnsThreeFSStorageSpec vcnsthreefs = 7;
         DummyStorageSpec dummy = 9;
         EventReportStorageSpec event_report = 14;
+        ValkeyStorageSpec valkey = 15;
     }
     bool check_storage_available_when_open = 8;
     // 响应中用于标识存储类型；请求中通常由 oneof storage_spec 确定类型。

@@ -211,9 +211,10 @@ private:
     std::vector<std::string> created_endpoints_;
 };
 
+class FutureValkeySdkConfig : public ValkeySdkConfig {};
+
 std::shared_ptr<SdkBackendConfig> MakeSdkConfig(int get_timeout_ms = 2000, int put_timeout_ms = 2000) {
-    auto config = std::make_shared<SdkBackendConfig>();
-    config->set_type(DataStorageType::DATA_STORAGE_TYPE_VALKEY);
+    auto config = std::make_shared<ValkeySdkConfig>();
     SdkTimeoutConfig timeout;
     timeout.set_get_timeout_ms(get_timeout_ms);
     timeout.set_put_timeout_ms(put_timeout_ms);
@@ -293,6 +294,22 @@ protected:
     std::shared_ptr<FakeRedisState> state_;
     std::unique_ptr<TestValkeySdk> sdk_;
 };
+
+TEST(ValkeySdkInitTest, RejectsPlainBaseConfigTaggedValkey) {
+    auto state = std::make_shared<FakeRedisState>();
+    TestValkeySdk sdk(state);
+    auto config = std::make_shared<SdkBackendConfig>();
+    config->set_type(DataStorageType::DATA_STORAGE_TYPE_VALKEY);
+
+    EXPECT_EQ(ER_INVALID_SDKBACKEND_CONFIG, sdk.Init(config, MakeStorageConfig()));
+}
+
+TEST(ValkeySdkInitTest, RejectsFutureValkeySdkConfigSubclass) {
+    auto state = std::make_shared<FakeRedisState>();
+    TestValkeySdk sdk(state);
+
+    EXPECT_EQ(ER_INVALID_SDKBACKEND_CONFIG, sdk.Init(std::make_shared<FutureValkeySdkConfig>(), MakeStorageConfig()));
+}
 
 TEST(ValkeySdkInitTest, ValidatesConfigsInitializesSeparateTimedPoolsAndReportsType) {
     auto state = std::make_shared<FakeRedisState>();

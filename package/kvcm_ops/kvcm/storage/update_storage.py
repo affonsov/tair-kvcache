@@ -35,6 +35,8 @@ def create_update_storage_data(args, storage_type: str, storage_spec: dict, pace
         if pace_storage_type is None:
             pace_storage_type = get_pace_storage_type(args.media_type)
         storage["storage_type"] = pace_storage_type
+    elif storage_type == "valkey":
+        storage["storage_type"] = "ST_VALKEY"
     return {
         "trace_id": args.trace_id,
         "storage": storage,
@@ -77,6 +79,28 @@ def get_existing_pace_config(host: str, trace_id: str, unique_name: str, verbose
         raise RuntimeError(f"storage '{unique_name}' has incompatible storage_type: {storage_type}")
 
     raise RuntimeError(f"PACE storage '{unique_name}' does not exist")
+
+
+def require_existing_valkey_storage(host: str, trace_id: str, unique_name: str, verbose: bool):
+    result = http_post(host, "/api/listStorage", {"trace_id": trace_id}, verbose)
+    status_code = result.get("header", {}).get("status", {}).get("code")
+    if status_code not in ("OK", 1):
+        raise RuntimeError(
+            f"list storage failed while resolving existing Valkey storage, status: {status_code}")
+
+    for storage in result.get("storage", []):
+        if storage.get("global_unique_name") != unique_name:
+            continue
+        storage_type = storage.get("storage_type", "ST_UNSPECIFIED")
+        if storage_type not in ("ST_VALKEY", 10) or not isinstance(storage.get("valkey"), dict):
+            # The Manager replaces a storage on update, so a mismatched
+            # subcommand would silently change the storage type.
+            raise RuntimeError(
+                f"storage '{unique_name}' has storage_type {storage_type}; "
+                "the 'valkey' subcommand only updates existing Valkey storage")
+        return
+
+    raise RuntimeError(f"Valkey storage '{unique_name}' does not exist")
 
 
 def http_post_and_print(host: str, data: dict, verbose: bool):
@@ -126,13 +150,21 @@ def handle_event_report(args):
     http_post_and_print(args.host, data, args.verbose)
 
 
+def handle_valkey(args):
+    require_existing_valkey_storage(args.host, args.trace_id, args.unique_name, args.verbose)
+    storage_spec = gen_valkey_config_data(args)
+    data = create_update_storage_data(args, "valkey", storage_spec)
+    http_post_and_print(args.host, data, args.verbose)
+
+
 def main():
     add_or_update_main(
         "update_storage",
         handle_nfs,
         handle_pace,
         handle_3fs,
-        handle_event_report)
+        handle_event_report,
+        handle_valkey)
 
 
 if __name__ == "__main__":

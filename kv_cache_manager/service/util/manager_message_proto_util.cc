@@ -68,6 +68,16 @@ void ProtoConvert::StorageConfigToProto(const StorageConfig &storage_config,
         auto *dummy = proto_storage_config->mutable_dummy();
         dummy->set_root_path(dummy_storage.root_path());
         dummy->set_key_count_per_file(dummy_storage.key_count_per_file());
+    } else if (type == DataStorageType::DATA_STORAGE_TYPE_VALKEY) {
+        proto_storage_config->set_storage_type(proto::admin::ST_VALKEY);
+        const auto valkey_storage = std::dynamic_pointer_cast<ValkeyStorageSpec>(storage_config.storage_spec());
+        if (valkey_storage == nullptr) {
+            // ListStorage converts every registered storage; never dereference a missing spec.
+            KVCM_LOG_WARN("valkey storage [%s] has no Valkey storage spec; omitting spec fields",
+                          storage_config.global_unique_name().c_str());
+        } else {
+            proto_storage_config->mutable_valkey()->set_endpoint(valkey_storage->endpoint());
+        }
     } else if (IsEventReportStorageType(type)) {
         const auto &er_spec = *std::dynamic_pointer_cast<EventReportStorageSpec>(storage_config.storage_spec());
         proto::admin::EventReportStorageSpec *spec = proto_storage_config->mutable_event_report();
@@ -171,6 +181,13 @@ void ProtoConvert::StorageFromProto(const proto::admin::StorageConfig *proto_sto
         spec.set_key_count_per_file(proto_storage_config->dummy().key_count_per_file());
         storage_config.set_storage_spec(std::make_shared<DummyStorageSpec>(spec));
         storage_config.set_type(DataStorageType::DATA_STORAGE_TYPE_DUMMY);
+        break;
+    }
+    case proto::admin::StorageConfig::kValkey: {
+        ValkeyStorageSpec spec;
+        spec.set_endpoint(proto_storage_config->valkey().endpoint());
+        storage_config.set_storage_spec(std::make_shared<ValkeyStorageSpec>(spec));
+        storage_config.set_type(DataStorageType::DATA_STORAGE_TYPE_VALKEY);
         break;
     }
     case proto::admin::StorageConfig::kEventReport: {
@@ -284,10 +301,8 @@ void ProtoConvert::CacheConfigToProto(const CacheConfig &cache_config_info,
         cache_config_info.migration_copy_poll_max_interval_ms());
     migration_config->mutable_copy_connect_timeout_ms()->set_value(
         cache_config_info.migration_copy_connect_timeout_ms());
-    migration_config->mutable_copy_submit_timeout_ms()->set_value(
-        cache_config_info.migration_copy_submit_timeout_ms());
-    migration_config->mutable_copy_query_timeout_ms()->set_value(
-        cache_config_info.migration_copy_query_timeout_ms());
+    migration_config->mutable_copy_submit_timeout_ms()->set_value(cache_config_info.migration_copy_submit_timeout_ms());
+    migration_config->mutable_copy_query_timeout_ms()->set_value(cache_config_info.migration_copy_query_timeout_ms());
     for (const auto &migration_strategy : cache_config_info.migration_strategies()) {
         if (migration_strategy == nullptr) {
             continue;
@@ -350,9 +365,8 @@ void ProtoConvert::CacheConfigFromProto(const proto::admin::CacheConfig *proto_c
     cache_config_info.set_migration_copy_execution_mode(
         static_cast<MigrationCopyExecutionMode>(proto_migration_config.copy_execution_mode()));
     cache_config_info.set_migration_copy_max_inflight_bytes(
-        proto_migration_config.has_copy_max_inflight_bytes()
-            ? proto_migration_config.copy_max_inflight_bytes().value()
-            : MigrationConfig::kDefaultCopyMaxInflightBytes);
+        proto_migration_config.has_copy_max_inflight_bytes() ? proto_migration_config.copy_max_inflight_bytes().value()
+                                                             : MigrationConfig::kDefaultCopyMaxInflightBytes);
     cache_config_info.set_migration_copy_operation_deadline_ms(
         proto_migration_config.has_copy_operation_deadline_ms()
             ? proto_migration_config.copy_operation_deadline_ms().value()
@@ -366,17 +380,14 @@ void ProtoConvert::CacheConfigFromProto(const proto::admin::CacheConfig *proto_c
             ? proto_migration_config.copy_poll_max_interval_ms().value()
             : MigrationConfig::kDefaultCopyPollMaxIntervalMs);
     cache_config_info.set_migration_copy_connect_timeout_ms(
-        proto_migration_config.has_copy_connect_timeout_ms()
-            ? proto_migration_config.copy_connect_timeout_ms().value()
-            : MigrationConfig::kDefaultCopyConnectTimeoutMs);
-    cache_config_info.set_migration_copy_submit_timeout_ms(
-        proto_migration_config.has_copy_submit_timeout_ms()
-            ? proto_migration_config.copy_submit_timeout_ms().value()
-            : MigrationConfig::kDefaultCopySubmitTimeoutMs);
-    cache_config_info.set_migration_copy_query_timeout_ms(
-        proto_migration_config.has_copy_query_timeout_ms()
-            ? proto_migration_config.copy_query_timeout_ms().value()
-            : MigrationConfig::kDefaultCopyQueryTimeoutMs);
+        proto_migration_config.has_copy_connect_timeout_ms() ? proto_migration_config.copy_connect_timeout_ms().value()
+                                                             : MigrationConfig::kDefaultCopyConnectTimeoutMs);
+    cache_config_info.set_migration_copy_submit_timeout_ms(proto_migration_config.has_copy_submit_timeout_ms()
+                                                               ? proto_migration_config.copy_submit_timeout_ms().value()
+                                                               : MigrationConfig::kDefaultCopySubmitTimeoutMs);
+    cache_config_info.set_migration_copy_query_timeout_ms(proto_migration_config.has_copy_query_timeout_ms()
+                                                              ? proto_migration_config.copy_query_timeout_ms().value()
+                                                              : MigrationConfig::kDefaultCopyQueryTimeoutMs);
 
     // 转换meta_indexer_config
     auto meta_indexer_config = std::make_shared<MetaIndexerConfig>();

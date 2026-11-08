@@ -54,6 +54,7 @@ private:
     // slot 5: DATA_STORAGE_TYPE_VCNS_HF3FS **UNUSED** (merged into HF3FS)
     // slot 6: DATA_STORAGE_TYPE_DUMMY availability flag (testing only)
     // slot 9: DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD availability flag
+    // slot 10: DATA_STORAGE_TYPE_VALKEY availability flag
     array_t_ storage_quota_avail_by_type_;
 };
 
@@ -65,6 +66,7 @@ DataStorageSelector::StorageQuotaAvail::StorageQuotaAvail() : storage_quota_avai
     storage_quota_avail_by_type_.at(ToIndex(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD)) = true;
     storage_quota_avail_by_type_.at(ToIndex(DataStorageType::DATA_STORAGE_TYPE_NFS)) = true;
     storage_quota_avail_by_type_.at(ToIndex(DataStorageType::DATA_STORAGE_TYPE_DUMMY)) = true;
+    storage_quota_avail_by_type_.at(ToIndex(DataStorageType::DATA_STORAGE_TYPE_VALKEY)) = true;
 }
 
 bool DataStorageSelector::StorageQuotaAvail::GetStorageQuotaAvailByType(const DataStorageType &type) const noexcept {
@@ -378,8 +380,7 @@ DataStorageSelector::CheckExplicitWriteTargets(RequestContext *request_context,
         PREFIX_LOG(WARN, "explicit target admission failed to read instance group: %s", instance_group.c_str());
         return results;
     }
-    const auto [instances_ec, instance_infos] =
-        registry_manager_->ListInstanceInfo(request_context, instance_group);
+    const auto [instances_ec, instance_infos] = registry_manager_->ListInstanceInfo(request_context, instance_group);
     if (instances_ec != EC_OK) {
         PREFIX_LOG(WARN, "explicit target admission failed to list instances: %s", instance_group.c_str());
         return results;
@@ -397,9 +398,8 @@ DataStorageSelector::CheckExplicitWriteTargets(RequestContext *request_context,
     }
 
     auto saturating_add = [](std::uint64_t &sum, const std::uint64_t value) {
-        sum = value > std::numeric_limits<std::uint64_t>::max() - sum
-                  ? std::numeric_limits<std::uint64_t>::max()
-                  : sum + value;
+        sum = value > std::numeric_limits<std::uint64_t>::max() - sum ? std::numeric_limits<std::uint64_t>::max()
+                                                                      : sum + value;
     };
     std::uint64_t group_used_bytes = 0;
     for (const auto &instance_info : instance_infos) {

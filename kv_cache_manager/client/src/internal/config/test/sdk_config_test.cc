@@ -115,8 +115,45 @@ TEST_F(SdkBackendConfigTest, TestSdkWrapperConfigGetSdkConfig) {
     auto nfs_config = sdk_wrapper_config.GetSdkBackendConfig(DataStorageType::DATA_STORAGE_TYPE_NFS);
     ASSERT_NE(nfs_config, nullptr);
 
+    auto valkey_config = sdk_wrapper_config.GetSdkBackendConfig(DataStorageType::DATA_STORAGE_TYPE_VALKEY);
+    ASSERT_NE(valkey_config, nullptr);
+    EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_VALKEY, valkey_config->type());
+    EXPECT_TRUE(valkey_config->Validate());
+
     auto unknown_config = sdk_wrapper_config.GetSdkBackendConfig(DataStorageType::DATA_STORAGE_TYPE_UNKNOWN);
     ASSERT_EQ(unknown_config, nullptr);
+}
+
+TEST_F(SdkBackendConfigTest, TestSdkWrapperConfigParsesValkeyAndKeepsUnknownUnsupported) {
+    SdkWrapperConfig sdk_wrapper_config;
+    ASSERT_TRUE(sdk_wrapper_config.FromJsonString(R"({
+        "thread_num": 8,
+        "queue_size": 2000,
+        "sdk_backend_configs": [{
+            "type": "valkey",
+            "sdk_log_file_path": "logs/valkey_client.log",
+            "sdk_log_level": "INFO",
+            "spec_byte_sizes_per_block": {}
+        }, {
+            "type": "future_storage",
+            "sdk_log_file_path": "logs/future.log",
+            "sdk_log_level": "INFO",
+            "spec_byte_sizes_per_block": {}
+        }],
+        "timeout_config": {"put_timeout_ms": 15000, "get_timeout_ms": 15000}
+    })"));
+
+    const auto valkey_config = sdk_wrapper_config.GetSdkBackendConfig(DataStorageType::DATA_STORAGE_TYPE_VALKEY);
+    ASSERT_NE(nullptr, valkey_config);
+    EXPECT_NE(nullptr, std::dynamic_pointer_cast<ValkeySdkConfig>(valkey_config));
+    EXPECT_EQ("logs/valkey_client.log", valkey_config->sdk_log_file_path());
+    EXPECT_TRUE(valkey_config->Validate());
+    EXPECT_EQ(nullptr, sdk_wrapper_config.GetSdkBackendConfig(DataStorageType::DATA_STORAGE_TYPE_UNKNOWN));
+    EXPECT_EQ(6u, sdk_wrapper_config.sdk_backend_configs_map().size());
+
+    SdkWrapperConfig restored;
+    ASSERT_TRUE(restored.FromJsonString(sdk_wrapper_config.ToJsonString()));
+    EXPECT_EQ(sdk_wrapper_config, restored);
 }
 
 TEST_F(SdkBackendConfigTest, TestSdkWrapperConfigParsesTairMempoolSsd) {
@@ -399,10 +436,7 @@ void SetProgrammaticBaseFields(SdkBackendConfig &config) {
     config.set_timeout_config(timeout);
 }
 
-class FutureValkeySdkConfig : public SdkBackendConfig {
-public:
-    FutureValkeySdkConfig() { set_type(DataStorageType::DATA_STORAGE_TYPE_VALKEY); }
-};
+class FutureValkeySdkConfig : public ValkeySdkConfig {};
 
 TEST_F(SdkBackendConfigTest, TestSdkWrapperConfigParsesValkeyBackend) {
     SdkWrapperConfig config;
@@ -420,7 +454,7 @@ TEST_F(SdkBackendConfigTest, TestSdkWrapperConfigParsesValkeyBackend) {
 
     const auto backend = config.GetSdkBackendConfig(DataStorageType::DATA_STORAGE_TYPE_VALKEY);
     ASSERT_NE(nullptr, backend);
-    EXPECT_EQ(typeid(SdkBackendConfig), typeid(*backend));
+    EXPECT_EQ(typeid(ValkeySdkConfig), typeid(*backend));
     EXPECT_EQ(DataStorageType::DATA_STORAGE_TYPE_VALKEY, backend->type());
     EXPECT_EQ("valkey.log", backend->sdk_log_file_path());
     EXPECT_TRUE(config.Validate());
@@ -482,12 +516,11 @@ TEST_F(SdkBackendConfigTest, TestTypeSafeClonePreservesEverySupportedConcreteCon
     ASSERT_EQ(typeid(NfsSdkConfig), typeid(*nfs_clone));
     EXPECT_EQ(*nfs, static_cast<const NfsSdkConfig &>(*nfs_clone));
 
-    auto valkey = std::make_shared<SdkBackendConfig>();
-    valkey->set_type(DataStorageType::DATA_STORAGE_TYPE_VALKEY);
+    auto valkey = std::make_shared<ValkeySdkConfig>();
     SetProgrammaticBaseFields(*valkey);
     auto valkey_clone = CloneSdkBackendConfig(valkey);
     ASSERT_NE(nullptr, valkey_clone);
-    ASSERT_EQ(typeid(SdkBackendConfig), typeid(*valkey_clone));
+    ASSERT_EQ(typeid(ValkeySdkConfig), typeid(*valkey_clone));
     EXPECT_EQ(*valkey, *valkey_clone);
 }
 
@@ -513,8 +546,7 @@ TEST_F(SdkBackendConfigTest, TestWrapperClonePreservesDynamicTypesAndProgrammati
     mooncake->set_local_mem_ptr(reinterpret_cast<void *>(0x4567));
     mooncake->set_local_buffer_size(100);
     mooncake->set_self_location_spec_name("tp-special");
-    auto valkey = std::make_shared<SdkBackendConfig>();
-    valkey->set_type(DataStorageType::DATA_STORAGE_TYPE_VALKEY);
+    auto valkey = std::make_shared<ValkeySdkConfig>();
     SetProgrammaticBaseFields(*valkey);
 
     auto source = std::make_shared<SdkWrapperConfig>();
@@ -532,7 +564,7 @@ TEST_F(SdkBackendConfigTest, TestWrapperClonePreservesDynamicTypesAndProgrammati
               clone->GetSdkBackendConfig(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE));
     EXPECT_EQ(typeid(MooncakeSdkConfig),
               typeid(*clone->GetSdkBackendConfig(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE)));
-    EXPECT_EQ(typeid(SdkBackendConfig), typeid(*clone->GetSdkBackendConfig(DataStorageType::DATA_STORAGE_TYPE_VALKEY)));
+    EXPECT_EQ(typeid(ValkeySdkConfig), typeid(*clone->GetSdkBackendConfig(DataStorageType::DATA_STORAGE_TYPE_VALKEY)));
 }
 
 } // namespace
