@@ -92,7 +92,7 @@ does not admit an output commit. Once a slice starts scattering under an
 admitted guard, that synchronous scatter finishes without a per-IOV deadline
 check. Before another slice begins I/O, cancellation and the original deadline
 are checked again. Cancellation can therefore wait only for the current
-synchronous copy and any current PR2 deadline-bounded Redis I/O. No host or
+synchronous copy and any current deadline-bounded Redis I/O. No host or
 device copy remains in flight after guard release or function return.
 
 Bounded memory requires partial publication for Get: if an earlier successful
@@ -131,10 +131,24 @@ or touching their addresses. All device copies are synchronous, and the
 worker's original current device is restored before the contextual call
 returns.
 
-The maintained vLLM, SGLang, and TensorRT-LLM connectors already submit CPU
-IOVs because their connector paths stage through host buffers. Direct
-`TransferClient` callers can now submit GPU IOVs and receive the synchronous
-Valkey staging behavior above.
+The maintained framework connectors construct CPU IOVs before calling the
+public `TransferClient`; they do not pass framework device buffers directly to
+the Valkey SDK:
+
+- vLLM's `KVCacheDataTransfer._make_block_buffers` creates one
+  `MemoryType.CPU` IOV per block over its host staging pool, which is pinned
+  on CUDA, before `SaveKvCaches` or `LoadKvCaches`.
+- SGLang's `_prepare_buffers` and `_prepare_extra_pool_buffers` create
+  `MemoryType.CPU` IOVs from the connector-provided host page pointers before
+  either transfer call.
+- TensorRT-LLM's `_prepare_buffers` first materializes each cache block with
+  `.cpu()`, then creates a `MemoryType.CPU` IOV. Loads synchronously copy that
+  host tensor back to the framework cache after `LoadKvCaches` returns.
+
+The connector contract therefore requires no duplicate Valkey GPU staging.
+Direct `TransferClient` callers can submit GPU IOVs and receive the synchronous
+Valkey staging behavior above. The framework connectors have not yet been
+qualified end to end against a live Valkey deployment.
 
 ## Result mapping and known limitations
 
@@ -163,6 +177,6 @@ Valkey staging behavior above.
 7. ManagerClient and RTPLLMClient calls that use TransferClient receive the
    wrapper budget without extra configuration.
 
-TLS, ACLs, credential references, and authenticated live-CI selection remain
-PR5-owned. In particular, PR3 does not duplicate or alter the live Valkey CI
-tag/comment used to select authenticated coverage.
+This contract covers the plaintext `valkey://` and `redis://` transports.
+Transport security and authentication for Valkey block storage are outside its
+scope.

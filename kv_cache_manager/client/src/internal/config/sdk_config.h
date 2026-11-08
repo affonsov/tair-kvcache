@@ -209,6 +209,11 @@ public:
     bool operator!=(const NfsSdkConfig &other) const { return !(*this == other); }
 };
 
+class ValkeySdkConfig : public SdkBackendConfig {
+public:
+    ValkeySdkConfig();
+};
+
 class SdkWrapperConfig : public Jsonizable {
 public:
     bool FromRapidValue(const rapidjson::Value &rapid_value) override;
@@ -251,7 +256,8 @@ private:
         {DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, std::make_shared<TairMempoolSdkConfig>()},
         {DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD,
          std::make_shared<TairMempoolSdkConfig>(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD)},
-        {DataStorageType::DATA_STORAGE_TYPE_NFS, std::make_shared<NfsSdkConfig>()}};
+        {DataStorageType::DATA_STORAGE_TYPE_NFS, std::make_shared<NfsSdkConfig>()},
+        {DataStorageType::DATA_STORAGE_TYPE_VALKEY, std::make_shared<ValkeySdkConfig>()}};
     SdkTimeoutConfig timeout_config_;
 };
 

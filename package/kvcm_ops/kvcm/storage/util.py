@@ -1,4 +1,5 @@
 import argparse
+import re
 from ..common.common_args import *
 
 # for add_storage/update_storage
@@ -61,6 +62,35 @@ def gen_event_report_config_data(args):
     if args.snapshot_min_interval_ms is not None:
         storage_spec["snapshot_min_interval_ms"] = args.snapshot_min_interval_ms
     return storage_spec
+
+
+def gen_valkey_config_data(args):
+    return {"endpoint": args.endpoint}
+
+
+_VALKEY_ENDPOINT_PATTERN = re.compile(
+    r"(?:valkey|redis)://[A-Za-z0-9._-]+:[0-9]+/(?:\?db=[0-9]+)?\Z"
+)
+_MAX_INT64 = (1 << 63) - 1
+
+
+def valkey_endpoint(value):
+    match = _VALKEY_ENDPOINT_PATTERN.fullmatch(value)
+    if match is None:
+        raise argparse.ArgumentTypeError(
+            "expected valkey:// or redis:// hostname:port/ with optional ?db=<nonnegative integer>"
+        )
+
+    authority_and_path = value.split("://", 1)[1]
+    authority, path_and_query = authority_and_path.split("/", 1)
+    port_text = authority.rsplit(":", 1)[1]
+    if not 1 <= int(port_text) <= 65535:
+        raise argparse.ArgumentTypeError("Valkey endpoint port must be between 1 and 65535")
+    if path_and_query:
+        db_text = path_and_query.removeprefix("?db=")
+        if int(db_text) > _MAX_INT64:
+            raise argparse.ArgumentTypeError("Valkey endpoint database number is out of range")
+    return value
 
 
 def add_nfs_sub_parser(subparsers):
@@ -163,6 +193,16 @@ def add_3fs_sub_parser(subparsers):
     return parser_3fs
 
 
+def add_valkey_sub_parser(subparsers):
+    parser = subparsers.add_parser('valkey', help='Valkey storage options')
+    parser.add_argument(
+        '--endpoint',
+        required=True,
+        type=valkey_endpoint,
+        help='Valkey endpoint, eg. valkey://127.0.0.1:6379/?db=0')
+    return parser
+
+
 def add_event_report_sub_parser(subparsers, name, help_text, event_report_storage_type):
     parser = subparsers.add_parser(name, help=help_text)
     parser.add_argument(
@@ -190,7 +230,7 @@ def add_event_report_sub_parser(subparsers, name, help_text, event_report_storag
 
 
 def add_or_update_main(method: str, handle_nfs, handle_pace, handle_3fs,
-                       handle_event_report):
+                       handle_event_report, handle_valkey=None):
     common_parser = create_common_parser()
     parser = argparse.ArgumentParser(
         prog=f"python3 script.kvcm.storage.{method}",
@@ -218,6 +258,7 @@ def add_or_update_main(method: str, handle_nfs, handle_pace, handle_3fs,
     parser_pace = add_pace_sub_parser(subparsers, media_type_default=media_type_default)
     parser_pace_ssd = add_pace_ssd_sub_parser(subparsers)
     parser_3fs = add_3fs_sub_parser(subparsers)
+    parser_valkey = add_valkey_sub_parser(subparsers) if handle_valkey is not None else None
     parser_event_report_l1p5 = add_event_report_sub_parser(
         subparsers,
         'event_report_l1p5',
@@ -233,6 +274,8 @@ def add_or_update_main(method: str, handle_nfs, handle_pace, handle_3fs,
     parser_pace.set_defaults(func=handle_pace)
     parser_pace_ssd.set_defaults(func=handle_pace)
     parser_3fs.set_defaults(func=handle_3fs)
+    if parser_valkey is not None:
+        parser_valkey.set_defaults(func=handle_valkey)
     parser_event_report_l1p5.set_defaults(func=handle_event_report)
     parser_event_report_l2.set_defaults(func=handle_event_report)
 

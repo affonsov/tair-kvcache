@@ -10,6 +10,7 @@ storage module:
         python3 -m kvcm_ops add_storage pace --help
         python3 -m kvcm_ops add_storage pace_ssd --help
         python3 -m kvcm_ops add_storage 3fs --help
+        python3 -m kvcm_ops add_storage valkey --help
 
         # add nfs storage, given "global_unique_name, root_path, key_kount_per_file"
         python3 -m kvcm_ops add_storage -u test_nfs_1 nfs -r /home/zhaotaonan.ztn/temp -k 16
@@ -24,6 +25,9 @@ storage module:
         python3 -m kvcm_ops add_storage -u common_3fs_storage 3fs -c '' -m '/3fs/stage/3fs/' -r "common_3fs" -k 16
         python3 -m kvcm_ops add_storage -u common_3fs_storage 3fs -c '' -m '/3fs/stage/3fs/' -r "common_3fs" -k 16 --not_touch_file_when_create
 
+        # add Valkey storage with an endpoint; authentication and TLS are not yet supported by this command
+        python3 -m kvcm_ops add_storage -u valkey_cache valkey --endpoint 'valkey://127.0.0.1:6379/?db=0'
+
         # add event_report storage
         python3 -m kvcm_ops add_storage -u test_vllm_1 event_report_l1p5 --heartbeat_timeout_ms 30000 --snapshot_min_interval_ms 30000
         python3 -m kvcm_ops add_storage -u test_vinyard_1 event_report_l2 --heartbeat_timeout_ms 30000 --snapshot_min_interval_ms 30000
@@ -33,6 +37,7 @@ storage module:
         python3 -m kvcm_ops update_storage pace --help
         python3 -m kvcm_ops update_storage pace_ssd --help
         python3 -m kvcm_ops update_storage 3fs --help
+        python3 -m kvcm_ops update_storage valkey --help
         python3 -m kvcm_ops update_storage -u test_nfs_1 nfs -r /home/zhaotaonan.ztn/temp -k 64
         # omitting --media_type preserves the current PACE storage type/media, including legacy media_type=5
         # omitting --skip_confirmed_missing_backend_delete preserves its current value; pass false to disable skipping
