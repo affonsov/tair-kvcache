@@ -38,7 +38,7 @@ public:
                                 const std::string &trace_id) override;
 
 protected:
-    virtual std::shared_ptr<RedisClient> CreateClient(const StandardUri &endpoint);
+    virtual std::shared_ptr<RedisClient> CreateClient(const RedisConnectionOptions &options);
     virtual std::string GenerateOpaqueId();
 
 private:

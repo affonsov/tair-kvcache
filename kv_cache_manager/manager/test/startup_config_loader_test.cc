@@ -1,7 +1,9 @@
+#include <fstream>
 #include <gtest/gtest.h>
 #include <memory>
 
 #include "kv_cache_manager/common/request_context.h"
+#include "kv_cache_manager/common/test/log_capture.h"
 #include "kv_cache_manager/common/unittest.h"
 #include "kv_cache_manager/config/instance_group.h"
 #include "kv_cache_manager/config/registry_manager.h"
@@ -117,6 +119,28 @@ TEST_F(StartupConfigLoaderTest, TestStartupConfigJsonize) {
 
     ASSERT_EQ(nfs_spec1->root_path(), nfs_spec2->root_path());
     ASSERT_EQ(nfs_spec1->key_count_per_file(), nfs_spec2->key_count_per_file());
+}
+
+TEST_F(StartupConfigLoaderTest, TestParseFailureLogsOnlyByteCount) {
+    const std::string directory_sentinel = "/startup/security-dir-sentinel";
+    const std::string config = R"({"storage_config":{"type":"valkey","storage_spec":{"endpoint":)"
+                               R"("valkeys://startup-endpoint-sentinel.invalid:16379/?db=1","security_dir":")" +
+                               directory_sentinel + R"("}},})";
+    const std::string path = GetPrivateTestRuntimeDataPath() + "invalid_startup_config.json";
+    {
+        std::ofstream file(path, std::ios::out | std::ios::binary | std::ios::trunc);
+        ASSERT_TRUE(file);
+        file << config;
+    }
+
+    test::ScopedLogCapture capture;
+    StartupConfigLoader loader;
+    EXPECT_FALSE(loader.Load(path));
+    const std::string &logs = capture.Stop();
+
+    EXPECT_NE(std::string::npos, logs.find("config_bytes=[" + std::to_string(config.size()) + "]")) << logs;
+    EXPECT_EQ(std::string::npos, logs.find("startup-endpoint-sentinel")) << logs;
+    EXPECT_EQ(std::string::npos, logs.find(directory_sentinel)) << logs;
 }
 
 TEST_F(StartupConfigLoaderTest, TestLoad) {

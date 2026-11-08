@@ -154,6 +154,48 @@ cc_library(
     ],
 )
 
+cc_library(
+    name = "secure_valkey_test_environment",
+    testonly = True,
+    srcs = ["secure_valkey_test_environment.cc"],
+    hdrs = ["secure_valkey_test_environment.h"],
+    visibility = [
+        "//kv_cache_manager/client/src/internal/sdk/test:__pkg__",
+        "//kv_cache_manager/client/test:__pkg__",
+        "//kv_cache_manager/data_storage/test:__pkg__",
+    ],
+    deps = ["@boringssl//:crypto"],
+)
+
+cc_library(
+    name = "log_capture",
+    testonly = True,
+    hdrs = ["log_capture.h"],
+    visibility = [
+        "//kv_cache_manager/client/src/internal/sdk/test:__pkg__",
+        "//kv_cache_manager/data_storage/test:__pkg__",
+        "//kv_cache_manager/manager/test:__pkg__",
+    ],
+    deps = ["@com_google_googletest//:gtest"],
+)
+
+cc_test(
+    name = "redis_client_secure_real_service_test",
+    srcs = ["redis_client_secure_real_service_test.cc"],
+    # CI selects manual live tests tagged "redis". This suite starts its own
+    # loopback TLS valkey-server from PATH (provided by the CI image).
+    tags = [
+        "manual",
+        "redis",
+    ],
+    deps = [
+        ":log_capture",
+        ":secure_valkey_test_environment",
+        "//kv_cache_manager/common:redis_client",
+        "//kv_cache_manager/common:unittest",
+    ],
+)
+
 cc_test(
     name = "redis_client_test",
     srcs = [

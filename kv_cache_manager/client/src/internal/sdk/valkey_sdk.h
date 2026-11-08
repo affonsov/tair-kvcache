@@ -67,7 +67,7 @@ protected:
 
     ClientErrorCode Alloc(const std::vector<DataStorageUri> &remote_uris,
                           std::vector<DataStorageUri> &alloc_uris) override;
-    virtual std::shared_ptr<RedisClient> CreateClient(const StandardUri &endpoint);
+    virtual std::shared_ptr<RedisClient> CreateClient(const RedisConnectionOptions &options);
     virtual bool PrepareClient(RedisClient &client);
     virtual RedisClientHandle AcquireGetClientUntil(Deadline deadline);
     virtual RedisClientHandle AcquirePutClientUntil(Deadline deadline);

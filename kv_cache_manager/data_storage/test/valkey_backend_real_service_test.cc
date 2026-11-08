@@ -1,9 +1,11 @@
 #include <cstdlib>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "kv_cache_manager/common/redis_client.h"
+#include "kv_cache_manager/common/test/secure_valkey_test_environment.h"
 #include "kv_cache_manager/common/unittest.h"
 #include "kv_cache_manager/data_storage/valkey_backend.h"
 #include "kv_cache_manager/data_storage/valkey_uri_util.h"
@@ -12,29 +14,34 @@
 namespace kv_cache_manager {
 namespace {
 
-std::string ValkeyEndpoint(int64_t db) {
-    const char *configured_host = std::getenv("KVCM_TEST_REDIS_HOST");
-    const std::string host = configured_host == nullptr ? "127.0.0.1" : configured_host;
-    return "valkey://" + host + ":6379/?db=" + std::to_string(db);
-}
+class ValkeyBackendRealServiceTest : public TESTBASE {
+public:
+    ValkeyBackendRealServiceTest() : server_("vlk03-primary") {}
 
-StorageConfig RealValkeyConfig(const std::string &identity, int64_t db) {
-    auto spec = std::make_shared<ValkeyStorageSpec>();
-    spec->set_endpoint(ValkeyEndpoint(db));
-    return StorageConfig(DataStorageType::DATA_STORAGE_TYPE_VALKEY, identity, spec);
-}
+protected:
+    // Plaintext valkey:// endpoints cannot carry credentials, so this suite
+    // starts its own unauthenticated loopback server instead of the shared one.
+    std::string ValkeyEndpoint(int64_t db) const { return server_.Endpoint("127.0.0.1", false, db); }
 
-std::unique_ptr<RedisClient> OpenFixtureClient(int64_t db) {
-    auto client = std::make_unique<RedisClient>(StandardUri::FromUri(ValkeyEndpoint(db)));
-    if (!client->Open()) {
-        return nullptr;
+    StorageConfig RealValkeyConfig(const std::string &identity, int64_t db) const {
+        auto spec = std::make_shared<ValkeyStorageSpec>();
+        spec->set_endpoint(ValkeyEndpoint(db));
+        return StorageConfig(DataStorageType::DATA_STORAGE_TYPE_VALKEY, identity, spec);
     }
-    return client;
-}
 
-class ValkeyBackendRealServiceTest : public TESTBASE {};
+    std::unique_ptr<RedisClient> OpenFixtureClient(int64_t db) const {
+        auto client = std::make_unique<RedisClient>(StandardUri::FromUri(ValkeyEndpoint(db)));
+        if (!client->Open()) {
+            return nullptr;
+        }
+        return client;
+    }
+
+    test::SecureValkeyTestServer server_;
+};
 
 TEST_F(ValkeyBackendRealServiceTest, ManagesLivenessDeletionAndDbStorageIsolation) {
+    ASSERT_TRUE(server_.StartPlaintextWithoutAuthentication());
     auto metrics_registry = std::make_shared<MetricsRegistry>();
     ValkeyDataStorageBackend backend(metrics_registry);
     ASSERT_EQ(EC_OK, backend.Open(RealValkeyConfig("vlk03-primary", 11), "real-service"));
@@ -88,6 +95,67 @@ TEST_F(ValkeyBackendRealServiceTest, ManagesLivenessDeletionAndDbStorageIsolatio
     db12_client->Close();
     db11_client->Close();
     EXPECT_EQ(EC_OK, isolated_backend.Close());
+    EXPECT_EQ(EC_OK, backend.Close());
+}
+
+constexpr char kSecureStorageIdentity[] = "secure-valkey-backend";
+
+StorageConfig SecureValkeyConfig(const test::SecureValkeyTestServer &server) {
+    auto spec = std::make_shared<ValkeyStorageSpec>();
+    spec->set_endpoint(server.Endpoint());
+    spec->set_security_dir(server.security_dir());
+    return StorageConfig(DataStorageType::DATA_STORAGE_TYPE_VALKEY, kSecureStorageIdentity, spec);
+}
+
+RedisConnectionOptions SecureConnectionOptions(const test::SecureValkeyTestServer &server) {
+    RedisConnectionOptions options;
+    options.endpoint = StandardUri::FromUri(server.Endpoint());
+    options.security.transport = RedisTransportSecurity::TLS_NAMED_ACL;
+    options.security.directory = server.security_dir();
+    return options;
+}
+
+class ValkeyBackendSecureRealServiceTest : public TESTBASE {
+public:
+    ValkeyBackendSecureRealServiceTest() : server_(kSecureStorageIdentity) {}
+
+protected:
+    test::SecureValkeyTestServer server_;
+};
+
+TEST_F(ValkeyBackendSecureRealServiceTest, ManagesLivenessBinaryValuesAndDeletion) {
+    ASSERT_TRUE(server_.StartTls());
+    auto metrics_registry = std::make_shared<MetricsRegistry>();
+    ValkeyDataStorageBackend backend(metrics_registry);
+    ASSERT_EQ(EC_OK, backend.Open(SecureValkeyConfig(server_), "real-service"));
+
+    const auto created = backend.Create({"duplicate", "duplicate"}, 256, "real-service", nullptr);
+    ASSERT_EQ(2u, created.size());
+    ASSERT_EQ(EC_OK, created[0].first);
+    ASSERT_EQ(EC_OK, created[1].first);
+    EXPECT_NE(created[0].second.ToUriString(), created[1].second.ToUriString());
+    EXPECT_EQ(0u, created[0].second.ToUriString().find(std::string("valkey://") + kSecureStorageIdentity + "/"));
+    EXPECT_EQ((std::vector<bool>{false, false}), backend.Exist({created[0].second, created[1].second}));
+
+    std::vector<std::string> created_keys;
+    for (const auto &item : created) {
+        std::string key;
+        ASSERT_TRUE(ValkeyLocationToRedisKey(item.second, kSecureStorageIdentity, key));
+        created_keys.push_back(std::move(key));
+    }
+    RedisClient fixture_client(SecureConnectionOptions(server_));
+    ASSERT_TRUE(fixture_client.Open());
+    const std::string binary_value("binary\0value\xff", 13);
+    ASSERT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}),
+              fixture_client.SetStrings(created_keys, {binary_value, std::string()}));
+    EXPECT_EQ((std::vector<bool>{true, true}), backend.Exist({created[0].second, created[1].second}));
+    EXPECT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}),
+              backend.Delete({created[0].second, created[1].second}, "real-service", nullptr));
+    EXPECT_EQ((std::vector<bool>{false, false}), backend.Exist({created[0].second, created[1].second}));
+    EXPECT_EQ((std::vector<ErrorCode>{EC_OK, EC_OK}),
+              backend.Delete({created[0].second, created[1].second}, "real-service", nullptr));
+
+    fixture_client.Close();
     EXPECT_EQ(EC_OK, backend.Close());
 }
 

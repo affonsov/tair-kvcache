@@ -175,8 +175,8 @@ public:
     }
 
 protected:
-    std::shared_ptr<RedisClient> CreateClient(const StandardUri &endpoint) override {
-        return std::make_shared<FakeGpuRedisClient>(endpoint);
+    std::shared_ptr<RedisClient> CreateClient(const RedisConnectionOptions &options) override {
+        return std::make_shared<FakeGpuRedisClient>(options.endpoint);
     }
     bool PrepareClient(RedisClient &) override { return true; }
     ValkeySetStringsResult SetStringsUntil(RedisClient &,

@@ -48,6 +48,10 @@ Use all four values together: `lease_ms=500`, `loop_interval_ms=25`, coordinatio
 
 In this path, `timeout_ms=100` bounds connection establishment and connection-pool acquisition. It is not a hard read deadline for a command on an established Redis connection. `retry_count=1` means one attempt, not one retry after an initial attempt. A stalled established Redis command can therefore delay failover beyond one second. The sub-second profile assumes a responsive, reachable coordination service; connectivity failures, service latency, process stalls, or scheduling stalls can delay promotion or prevent it until coordination recovers.
 
+## Secure Valkey block storage
+
+Valkey data storage accepts `valkeys://host:port/?db=N` with one absolute `security_dir` reference. The mounted directory, named ACL requirements, TLS identity checks, private-network rule, compatibility behavior, and exclusions are documented in [Secure Valkey block storage](design/secure_valkey_storage.md).
+
 ## KVCacheManager Server Config
 
 ### 通用服务配置

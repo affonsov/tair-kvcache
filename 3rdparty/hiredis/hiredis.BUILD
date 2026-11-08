@@ -7,14 +7,21 @@ genrule(
 
 cc_library(
     name = "hiredis",
-    srcs = glob(["*.c"], exclude=["ssl.c"]),
+    srcs = glob(
+        ["*.c"],
+        exclude = ["test.c"],
+    ),
     hdrs = glob(["*.h"]) + [":hiredis_pkg_include_hiredis_h"],
+    copts = ["-Wno-unused-function"],
     # "." keeps #include <hiredis.h> working; pkg_include matches distro layout for
     # #include <hiredis/hiredis.h> (e.g. mooncake-store redis HA code).
     includes = [
         ".",
         "pkg_include",
     ],
-    copts = ["-Wno-unused-function"],
     visibility = ["//visibility:public"],
+    deps = [
+        "@boringssl//:crypto",
+        "@boringssl//:ssl",
+    ],
 )
