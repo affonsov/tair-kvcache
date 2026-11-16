@@ -47,7 +47,26 @@ curl -g -vvv -X POST http://127.0.0.1:6492/api/addStorage \
         "check_storage_available_when_open": false
     }
 }'
+
+curl -g -vvv -X POST http://127.0.0.1:6492/api/addStorage \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json" \
+  -d '{
+    "trace_id": "trace_valkey_01",
+    "storage": {
+        "global_unique_name": "valkey_01",
+        "storage_type": "ST_VALKEY",
+        "valkey": {
+            "endpoint": "valkey://127.0.0.1:6379/?db=0"
+        },
+        "check_storage_available_when_open": true
+    }
+}'
 ```
+
+Valkey Storage (`ST_VALKEY`) takes an `endpoint` of the form
+`valkey://<host>:<port>/` or `redis://<host>:<port>/`, optionally followed by
+`?db=<nonnegative integer>`. Credentials are not accepted in the endpoint.
 
 TairMempool Storage（`ST_TAIRMEMPOOL` / `ST_TAIRMEMPOOL_SSD`）可以在 `tair_mem_pool`
 对象中设置 `"skip_confirmed_missing_backend_delete": true`。默认 `false`，即 GC 对已判定

@@ -2,6 +2,16 @@ load("@rules_python//python:py_test.bzl", "py_test")
 
 package(default_visibility = ["//visibility:private"])
 
+config_setting(
+    name = "using_cuda",
+    values = {"define": "using_cuda=true"},
+)
+
+config_setting(
+    name = "using_musa",
+    values = {"define": "using_musa=true"},
+)
+
 cc_test(
     name = "MetaClientTest",
     srcs = [
@@ -25,6 +35,56 @@ cc_test(
     deps = [
         "//kv_cache_manager/client",
         "//kv_cache_manager/common:unittest",
+    ],
+)
+
+cc_test(
+    name = "ValkeyTransferClientTest",
+    srcs = [
+        "valkey_loopback_test_server.h",
+        "valkey_transfer_client_test.cc",
+    ],
+    deps = [
+        "//kv_cache_manager/client",
+        "//kv_cache_manager/common:unittest",
+    ],
+)
+
+cc_test(
+    name = "ValkeyTransferClientGpuTest",
+    srcs = [
+        "valkey_loopback_test_server.h",
+        "valkey_transfer_client_gpu_test.cc",
+    ],
+    target_compatible_with = select({
+        ":using_cuda": [],
+        ":using_musa": [],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
+    deps = [
+        "//kv_cache_manager/client",
+        "//kv_cache_manager/common:unittest",
+    ] + select({
+        ":using_cuda": ["@local_config_cuda//cuda"],
+        ":using_musa": ["@local_config_musa//:musa"],
+        "//conditions:default": [],
+    }),
+)
+
+cc_test(
+    name = "valkey_transfer_client_real_service_test",
+    srcs = ["valkey_transfer_client_real_service_test.cc"],
+    tags = [
+        "manual",
+        "valkey",
+    ],
+    deps = [
+        "//kv_cache_manager/client",
+        "//kv_cache_manager/common:unittest",
+        "//kv_cache_manager/data_storage",
+        "//kv_cache_manager/metrics:metrics_registry",
+        "//kv_cache_manager/protocol/protobuf:service_cc_proto",
+        "//kv_cache_manager/service/util:manager_message_proto_util",
     ],
 )
 

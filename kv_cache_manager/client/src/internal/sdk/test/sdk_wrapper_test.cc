@@ -1594,7 +1594,7 @@ TEST_F(SdkWrapperTest, JsonConfigInitializesValkeyThroughFactoryWithoutNetwork) 
     EXPECT_NE(nullptr, wrapper.sdk_map_.at("valkey-primary"));
     const auto cloned_config = wrapper.wrapper_config_->GetSdkBackendConfig(DataStorageType::DATA_STORAGE_TYPE_VALKEY);
     ASSERT_NE(nullptr, cloned_config);
-    EXPECT_EQ(typeid(SdkBackendConfig), typeid(*cloned_config));
+    EXPECT_EQ(typeid(ValkeySdkConfig), typeid(*cloned_config));
 }
 
 namespace {

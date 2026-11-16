@@ -74,6 +74,22 @@ public:
     }
 };
 
+class InspectableStaticWeightSLPolicy : public StaticWeightSLPolicy {
+public:
+    static const WeightArray &DefaultStorageWeights() { return default_storage_weights_; }
+    static constexpr uint32_t NeutralWeight() { return StorageTypeWeights::DEFAULT; }
+};
+
+TEST_F(SelectLocationPolicyTest, TestStaticWeightsPreserveExistingValuesAndUseNeutralValkeyWeight) {
+    const auto &weights = InspectableStaticWeightSLPolicy::DefaultStorageWeights();
+    const StaticWeightSLPolicy::WeightArray expected{1, 3, 3, 3, 5, 3, 1, 10, 10, 3, 1};
+    EXPECT_EQ(expected, weights);
+
+    const auto valkey_weight = weights.at(ToIndex(DataStorageType::DATA_STORAGE_TYPE_VALKEY));
+    EXPECT_EQ(InspectableStaticWeightSLPolicy::NeutralWeight(), valkey_weight);
+    EXPECT_NE(0u, valkey_weight);
+}
+
 TEST_F(SelectLocationPolicyTest, TestStaticWeightSLPolicySelectForMatch) {
     StaticWeightSLPolicy policy;
     {

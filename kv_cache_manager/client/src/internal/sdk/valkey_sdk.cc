@@ -180,7 +180,8 @@ ClientErrorCode ValkeySdk::Init(const std::shared_ptr<SdkBackendConfig> &sdk_bac
         KVCM_LOG_WARN("valkey sdk is already initialized; reinitialization is not supported");
         return ER_SDKINIT_ERROR;
     }
-    if (!sdk_backend_config || !sdk_backend_config->Validate() || !sdk_backend_config->timeout_config().Validate() ||
+    if (!sdk_backend_config || typeid(*sdk_backend_config) != typeid(ValkeySdkConfig) ||
+        !sdk_backend_config->Validate() || !sdk_backend_config->timeout_config().Validate() ||
         sdk_backend_config->type() != DataStorageType::DATA_STORAGE_TYPE_VALKEY) {
         return ER_INVALID_SDKBACKEND_CONFIG;
     }
