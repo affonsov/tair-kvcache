@@ -158,9 +158,9 @@ public:
     }
 
     std::vector<std::vector<ErrorCode>> GetLocationsForMaintenance(RequestContext *context,
-                                                                  const KeyTypeVec &keys,
-                                                                  const LocationIdsPerKey &ids,
-                                                                  LocationsPerKey &locations) noexcept override {
+                                                                   const KeyTypeVec &keys,
+                                                                   const LocationIdsPerKey &ids,
+                                                                   LocationsPerKey &locations) noexcept override {
         ++maintenance_read_calls;
         return MetaLocalBackend::GetLocationsForMaintenance(context, keys, ids, locations);
     }
@@ -174,9 +174,9 @@ public:
     }
 
     std::vector<ErrorCode> Upsert(RequestContext *,
-                                const KeyTypeVec &keys,
-                                const CacheLocationMapVector &locations,
-                                const PropertyMapVector &properties) noexcept override {
+                                  const KeyTypeVec &keys,
+                                  const CacheLocationMapVector &locations,
+                                  const PropertyMapVector &properties) noexcept override {
         pending.emplace_back([this, keys, locations, properties] {
             (void)MetaLocalBackend::Upsert(nullptr, keys, locations, properties);
         });
@@ -184,10 +184,10 @@ public:
     }
 
     std::vector<ErrorCode> Upsert(RequestContext *context,
-                                 const KeyTypeVec &keys,
-                                 const CacheLocationMapVector &locations,
-                                 const PropertyMapVector &properties,
-                                 const std::vector<ErrorCode> &previous_error_codes) noexcept override {
+                                  const KeyTypeVec &keys,
+                                  const CacheLocationMapVector &locations,
+                                  const PropertyMapVector &properties,
+                                  const std::vector<ErrorCode> &previous_error_codes) noexcept override {
         if (previous_error_codes.size() != keys.size()) {
             return std::vector<ErrorCode>(keys.size(), EC_ERROR);
         }
@@ -886,10 +886,10 @@ TEST_F(MetaIndexerTest, TestRecoverGcAllowsOnlineRmwRecreationBeforeDeleteConsum
                 EXPECT_EQ(std::vector<ErrorCode>{EC_OK}, ecs);
                 return {MA_DELETE, {EC_OK}};
             };
-            ASSERT_EQ(EC_OK,
-                      meta_indexer_->ReadModifyWriteLocationsForMaintenance(
-                                       request_context_.get(), keys, {{"L1"}}, remove)
-                          .ec);
+            ASSERT_EQ(
+                EC_OK,
+                meta_indexer_->ReadModifyWriteLocationsForMaintenance(request_context_.get(), keys, {{"L1"}}, remove)
+                    .ec);
             ASSERT_EQ(0u, meta_indexer_->GetKeyCount());
             ASSERT_EQ(1u, queued->pending.size());
             ASSERT_EQ(0, queued->sync_calls);
@@ -917,10 +917,9 @@ TEST_F(MetaIndexerTest, TestRecoverGcAllowsOnlineRmwRecreationBeforeDeleteConsum
                     locations[0] = MakeLocation("L2", "new_uri");
                     return {MA_OK, {EC_OK}};
                 };
-                ASSERT_EQ(EC_OK,
-                          meta_indexer_->ReadModifyWriteTargetLocations(
-                                           request_context_.get(), keys, {{"L2"}}, add)
-                              .ec);
+                ASSERT_EQ(
+                    EC_OK,
+                    meta_indexer_->ReadModifyWriteTargetLocations(request_context_.get(), keys, {{"L2"}}, add).ec);
             }
             EXPECT_EQ(1u, meta_indexer_->GetKeyCount());
             EXPECT_EQ(0, queued->sync_calls);
@@ -959,8 +958,7 @@ TEST_F(MetaIndexerTest, TestMaintenanceKeepsRecoverWriteRouteWhenModifierFinishe
     ASSERT_EQ(EC_OK, hot->Init("test", config));
     ASSERT_EQ(EC_OK, hot->Open());
     const auto target = MakeLocation("L1", "target_uri");
-    ASSERT_EQ(std::vector<ErrorCode>{EC_OK},
-              persistent->Put(nullptr, {42}, {{{"L1", target}}}, PropertyMapVector(1)));
+    ASSERT_EQ(std::vector<ErrorCode>{EC_OK}, persistent->Put(nullptr, {42}, {{{"L1", target}}}, PropertyMapVector(1)));
     ASSERT_EQ(std::vector<ErrorCode>{EC_OK}, hot->Put(nullptr, {42}, {{{"L1", target}}}, PropertyMapVector(1)));
     auto &manager = *meta_indexer_->backend_manager_;
     manager.persistent_backend_ = std::move(persistent);
@@ -975,16 +973,15 @@ TEST_F(MetaIndexerTest, TestMaintenanceKeepsRecoverWriteRouteWhenModifierFinishe
         persistent_called_before_hot = exists.size() == 1 && exists[0];
     };
     const auto remove = [&manager](const std::vector<ErrorCode> &ecs,
-                                  const LocationIdVector &,
-                                  size_t,
-                                  CacheLocationVector &,
-                                  PropertyMap &) -> LocationModifierResult {
+                                   const LocationIdVector &,
+                                   size_t,
+                                   CacheLocationVector &,
+                                   PropertyMap &) -> LocationModifierResult {
         manager.recover_state_.store(MetaStorageBackendManager::RecoverState::kRunning);
         return {MA_DELETE, ecs};
     };
     ASSERT_EQ(EC_OK,
-              meta_indexer_->ReadModifyWriteLocationsForMaintenance(request_context_.get(), {42}, {{"L1"}}, remove)
-                  .ec);
+              meta_indexer_->ReadModifyWriteLocationsForMaintenance(request_context_.get(), {42}, {{"L1"}}, remove).ec);
     EXPECT_TRUE(persistent_called_before_hot);
     EXPECT_EQ(0, backend->sync_calls);
     EXPECT_EQ(0u, meta_indexer_->GetKeyCount());
@@ -998,8 +995,7 @@ TEST_F(MetaIndexerTest, TestMaintenanceKeepsRecoverWriteRouteWhenModifierFinishe
 TEST_F(MetaIndexerTest, TestCachedMaintenanceSeesOnlineUpdateWithoutDrainingRedis) {
     for (const bool memory_primary : {false, true}) {
         for (const bool recovering : {false, true}) {
-            SCOPED_TRACE(::testing::Message() << "memory_primary=" << memory_primary
-                                             << " recovering=" << recovering);
+            SCOPED_TRACE(::testing::Message() << "memory_primary=" << memory_primary << " recovering=" << recovering);
             meta_indexer_ = std::make_shared<MetaIndexer>();
             ASSERT_EQ(EC_OK, InitIndexer(R"({
                 "max_key_count":100, "mutex_shard_num":8,
@@ -1026,7 +1022,7 @@ TEST_F(MetaIndexerTest, TestCachedMaintenanceSeesOnlineUpdateWithoutDrainingRedi
             manager.cache_backend_ = std::move(hot);
             manager.memory_primary_ = memory_primary;
             manager.recover_state_.store(recovering ? MetaStorageBackendManager::RecoverState::kRecover
-                                                   : MetaStorageBackendManager::RecoverState::kRunning);
+                                                    : MetaStorageBackendManager::RecoverState::kRunning);
             meta_indexer_->key_count_.store(1);
 
             // A successful business RMW updates hot while its Redis write is
@@ -1038,19 +1034,20 @@ TEST_F(MetaIndexerTest, TestCachedMaintenanceSeesOnlineUpdateWithoutDrainingRedi
             ASSERT_EQ(std::vector<ErrorCode>{EC_OK}, manager.Upsert(nullptr, update));
             ASSERT_EQ(1u, queued->pending.size());
             int modifier_calls = 0;
-            const auto remove = [&modifier_calls, &old_location, &replacement](const std::vector<ErrorCode> &ecs,
-                                                                             const LocationIdVector &,
-                                                                             size_t,
-                                                                             CacheLocationVector &locations,
-                                                                             PropertyMap &) -> LocationModifierResult {
+            const auto remove =
+                [&modifier_calls, &old_location, &replacement](const std::vector<ErrorCode> &ecs,
+                                                               const LocationIdVector &,
+                                                               size_t,
+                                                               CacheLocationVector &locations,
+                                                               PropertyMap &) -> LocationModifierResult {
                 ++modifier_calls;
                 EXPECT_EQ(std::vector<ErrorCode>{EC_OK}, ecs);
                 EXPECT_EQ(replacement->ToJsonString(), locations[0]->ToJsonString());
                 return {MA_DELETE,
                         {locations[0]->ToJsonString() == old_location->ToJsonString() ? EC_OK : EC_MISMATCH}};
             };
-            const auto result = meta_indexer_->ReadModifyWriteLocationsForMaintenance(
-                request_context_.get(), keys, {{"L1"}}, remove);
+            const auto result =
+                meta_indexer_->ReadModifyWriteLocationsForMaintenance(request_context_.get(), keys, {{"L1"}}, remove);
             EXPECT_EQ(EC_OK, result.ec);
             ASSERT_EQ(1u, result.per_location_error_codes.size());
             EXPECT_EQ(std::vector<ErrorCode>{EC_MISMATCH}, result.per_location_error_codes[0]);
@@ -1081,8 +1078,7 @@ TEST_F(MetaIndexerTest, TestSingleBackendOrdinaryGcRetainsOrdinaryTargetRead) {
     ASSERT_EQ(EC_OK, persistent->Init("test", config));
     ASSERT_EQ(EC_OK, persistent->Open());
     const auto target = MakeLocation("L1", "target_uri");
-    ASSERT_EQ(std::vector<ErrorCode>{EC_OK},
-              persistent->Put(nullptr, {42}, {{{"L1", target}}}, PropertyMapVector(1)));
+    ASSERT_EQ(std::vector<ErrorCode>{EC_OK}, persistent->Put(nullptr, {42}, {{{"L1", target}}}, PropertyMapVector(1)));
     auto &manager = *meta_indexer_->backend_manager_;
     manager.persistent_backend_ = std::move(persistent);
     manager.cache_backend_.reset();
@@ -1090,15 +1086,20 @@ TEST_F(MetaIndexerTest, TestSingleBackendOrdinaryGcRetainsOrdinaryTargetRead) {
     // Ordinary GC does not fill missing keys without a hot mirror. Keep
     // its original target read, including local access/LRU updates.
     const auto result = meta_indexer_->ReadModifyWriteLocation(
-        request_context_.get(), {42}, {{"L1"}}, [target](const std::vector<ErrorCode> &ecs,
-                                                        const LocationIdVector &,
-                                                        size_t,
-                                                        CacheLocationVector &locations,
-                                                        PropertyMap &) -> LocationModifierResult {
+        request_context_.get(),
+        {42},
+        {{"L1"}},
+        [target](const std::vector<ErrorCode> &ecs,
+                 const LocationIdVector &,
+                 size_t,
+                 CacheLocationVector &locations,
+                 PropertyMap &) -> LocationModifierResult {
             EXPECT_EQ(std::vector<ErrorCode>{EC_OK}, ecs);
             EXPECT_EQ(target->ToJsonString(), locations[0]->ToJsonString());
             return {MA_SKIP, ecs};
-        }, true, true);
+        },
+        true,
+        true);
     EXPECT_EQ(EC_OK, result.ec);
     EXPECT_EQ(std::vector<ErrorCode>{EC_OK}, result.per_location_error_codes[0]);
     EXPECT_EQ(1, backend->target_read_calls);
@@ -1136,11 +1137,14 @@ TEST_F(MetaIndexerTest, TestSingleBackendMaintenancePreservesQueueBarriers) {
         }
         int modifier_calls = 0;
         const auto removed = meta_indexer_->ReadModifyWriteLocationsForMaintenance(
-            request_context_.get(), {42}, {{"L1"}}, [&modifier_calls](const std::vector<ErrorCode> &ecs,
-                                                                     const LocationIdVector &,
-                                                                     size_t,
-                                                                     CacheLocationVector &,
-                                                                     PropertyMap &) -> LocationModifierResult {
+            request_context_.get(),
+            {42},
+            {{"L1"}},
+            [&modifier_calls](const std::vector<ErrorCode> &ecs,
+                              const LocationIdVector &,
+                              size_t,
+                              CacheLocationVector &,
+                              PropertyMap &) -> LocationModifierResult {
                 ++modifier_calls;
                 return {MA_DELETE, ecs};
             });
@@ -1430,7 +1434,7 @@ TEST_F(MetaIndexerTest, TestMetadataPersistAndRecover) {
 
     // persist
     meta_indexer_->key_count_.store(3);
-    const std::vector<std::uint64_t> expected_usage_vec{1, 100, 200, 300, 400, 500, 600, 700, 800, 900};
+    const std::vector<std::uint64_t> expected_usage_vec{1, 100, 200, 300, 400, 500, 600, 700, 800, 900, 1000};
     ASSERT_EQ(expected_usage_vec.size(), meta_indexer_->storage_usage_data_.storage_usage_by_type_.size());
     for (std::size_t i = 0; i != meta_indexer_->storage_usage_data_.storage_usage_by_type_.size(); ++i) {
         meta_indexer_->storage_usage_data_.storage_usage_by_type_.at(i).store(expected_usage_vec.at(i));
@@ -1495,7 +1499,9 @@ TEST_F(MetaIndexerTest, TestStorageUsageDataManipulation) {
         ASSERT_EQ(0, meta_indexer_->GetStorageUsage());
 
         auto type = DataStorageType::DATA_STORAGE_TYPE_UNKNOWN;
-        std::vector<std::uint64_t> expected_usage_vec{0, 100, 200, 300, 400, 0, 0, 700, 800, 900};
+        std::vector<std::uint64_t> expected_usage_vec{0, 100, 200, 300, 400, 0, 0, 700, 800, 900, 1000};
+        ASSERT_EQ(11, static_cast<int>(DataStorageType::COUNT));
+        ASSERT_EQ(11u, meta_indexer_->storage_usage_data_.storage_usage_by_type_.size());
 
         type = DataStorageType::DATA_STORAGE_TYPE_HF3FS;
         meta_indexer_->SetStorageUsageByType(type, expected_usage_vec.at(static_cast<std::size_t>(type)));
@@ -1516,6 +1522,9 @@ TEST_F(MetaIndexerTest, TestStorageUsageDataManipulation) {
         meta_indexer_->SetStorageUsageByType(type, expected_usage_vec.at(static_cast<std::size_t>(type)));
 
         type = DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD;
+        meta_indexer_->SetStorageUsageByType(type, expected_usage_vec.at(static_cast<std::size_t>(type)));
+
+        type = DataStorageType::DATA_STORAGE_TYPE_VALKEY;
         meta_indexer_->SetStorageUsageByType(type, expected_usage_vec.at(static_cast<std::size_t>(type)));
 
         for (std::size_t i = 0; i != meta_indexer_->storage_usage_data_.storage_usage_by_type_.size(); ++i) {
@@ -1542,6 +1551,10 @@ TEST_F(MetaIndexerTest, TestStorageUsageDataManipulation) {
 
         type = DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD;
         ASSERT_EQ(expected_usage_vec.at(static_cast<std::size_t>(type)), meta_indexer_->GetStorageUsageByType(type));
+
+        type = DataStorageType::DATA_STORAGE_TYPE_VALKEY;
+        ASSERT_EQ(expected_usage_vec.at(static_cast<std::size_t>(type)), meta_indexer_->GetStorageUsageByType(type));
+        ASSERT_EQ(expected_usage_vec.at(10), meta_indexer_->storage_usage_data_.storage_usage_by_type_.at(10).load());
         ASSERT_EQ(300, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL));
 
         std::uint64_t expect_usage = 0;
@@ -1558,7 +1571,7 @@ TEST_F(MetaIndexerTest, TestStorageUsageDataManipulation) {
     {
         meta_indexer_->storage_usage_data_.Reset();
         auto type = DataStorageType::DATA_STORAGE_TYPE_UNKNOWN;
-        std::vector<std::uint64_t> expected_usage_vec{0, 100, 200, 300, 400, 0, 0, 0, 0, 900};
+        std::vector<std::uint64_t> expected_usage_vec{0, 100, 200, 300, 400, 0, 0, 0, 0, 900, 1000};
 
         type = DataStorageType::DATA_STORAGE_TYPE_HF3FS;
         meta_indexer_->SetStorageUsageByType(type, expected_usage_vec.at(static_cast<std::size_t>(type)));
@@ -1607,12 +1620,20 @@ TEST_F(MetaIndexerTest, TestStorageUsageDataManipulation) {
                   meta_indexer_->GetStorageUsageByType(type));
         meta_indexer_->SubStorageUsageByType(type, 16);
         ASSERT_EQ(expected_usage_vec.at(static_cast<std::size_t>(type)), meta_indexer_->GetStorageUsageByType(type));
+
+        type = DataStorageType::DATA_STORAGE_TYPE_VALKEY;
+        meta_indexer_->SetStorageUsageByType(type, expected_usage_vec.at(static_cast<std::size_t>(type)));
+        meta_indexer_->AddStorageUsageByType(type, 16);
+        ASSERT_EQ(expected_usage_vec.at(static_cast<std::size_t>(type)) + 16,
+                  meta_indexer_->GetStorageUsageByType(type));
+        meta_indexer_->SubStorageUsageByType(type, 16);
+        ASSERT_EQ(expected_usage_vec.at(static_cast<std::size_t>(type)), meta_indexer_->GetStorageUsageByType(type));
     }
 
     // test special case: DATA_STORAGE_TYPE_VCNS_HF3FS behavior as DATA_STORAGE_TYPE_HF3FS
     {
         meta_indexer_->storage_usage_data_.Reset();
-        std::vector<std::uint64_t> expected_usage_vec{0, 128, 0, 0, 0, 0, 0, 0, 0, 0};
+        std::vector<std::uint64_t> expected_usage_vec{0, 128, 0, 0, 0, 0, 0, 0, 0, 0, 0};
 
         meta_indexer_->SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS, 128);
         ASSERT_EQ(128, meta_indexer_->GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_VCNS_HF3FS));
@@ -1647,7 +1668,7 @@ TEST_F(MetaIndexerTest, TestStorageUsageDataSeriDeseri) {
 
     // Successful round-trip: serialize then deserialize
     {
-        std::vector<std::uint64_t> expected_usage_vec{1, 100, 200, 300, 400, 500, 600, 700, 800, 900};
+        std::vector<std::uint64_t> expected_usage_vec{1, 100, 200, 300, 400, 500, 600, 700, 800, 900, 1000};
 
         storage_usage_data.Reset();
         for (std::size_t i = 0; i != expected_usage_vec.size(); ++i) {
@@ -1656,7 +1677,7 @@ TEST_F(MetaIndexerTest, TestStorageUsageDataSeriDeseri) {
 
         std::string serialized = storage_usage_data.Serialize();
         ASSERT_EQ(
-            R"({"unknown":1,"hf3fs":100,"mooncake":200,"pace":300,"file":400,"vcns_hf3fs":500,"dummy":600,"event_report_l1p5":700,"event_report_l2":800,"pace_ssd":900})",
+            R"({"unknown":1,"hf3fs":100,"mooncake":200,"pace":300,"file":400,"vcns_hf3fs":500,"dummy":600,"event_report_l1p5":700,"event_report_l2":800,"pace_ssd":900,"valkey":1000})",
             serialized);
 
         storage_usage_data.Reset();
@@ -1668,12 +1689,12 @@ TEST_F(MetaIndexerTest, TestStorageUsageDataSeriDeseri) {
 
     // Legal input: keys in different order
     {
-        const std::vector<std::uint64_t> expected_usage_vec{1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
+        const std::vector<std::uint64_t> expected_usage_vec{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11};
         storage_usage_data.Reset();
         ASSERT_EQ(
             EC_OK,
             storage_usage_data.Deserialize(
-                R"({"pace_ssd":10,"event_report_l2":9,"event_report_l1p5":8,"dummy":7,"vcns_hf3fs":6,"file":5,"pace":4,"mooncake":3,"hf3fs":2,"unknown":1})"));
+                R"({"valkey":11,"pace_ssd":10,"event_report_l2":9,"event_report_l1p5":8,"dummy":7,"vcns_hf3fs":6,"file":5,"pace":4,"mooncake":3,"hf3fs":2,"unknown":1})"));
         for (std::size_t i = 0; i != storage_usage_data.storage_usage_by_type_.size(); ++i) {
             ASSERT_EQ(expected_usage_vec.at(i), storage_usage_data.storage_usage_by_type_.at(i).load());
         }
@@ -1688,29 +1709,55 @@ TEST_F(MetaIndexerTest, TestStorageUsageDataSeriDeseri) {
         ASSERT_EQ(200, storage_usage_data.GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_MOONCAKE));
         ASSERT_EQ(0, storage_usage_data.GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL));
         ASSERT_EQ(0, storage_usage_data.GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD));
+        ASSERT_EQ(0, storage_usage_data.GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_VALKEY));
         ASSERT_EQ(0, storage_usage_data.GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_NFS));
         ASSERT_EQ(0, storage_usage_data.GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_DUMMY));
     }
 
-    // Keep persisted metadata readable by older binaries until SSD accounting
-    // is actually used; a zero-valued new field is intentionally omitted.
+    // Keep persisted metadata readable by pre-Valkey binaries until Valkey
+    // accounting is actually used. Existing zero-valued SSD omission remains
+    // unchanged, so this is the exact pre-Valkey JSON shape.
     {
         storage_usage_data.Reset();
         storage_usage_data.SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL, 10);
         EXPECT_EQ(
             R"({"unknown":0,"hf3fs":0,"mooncake":0,"pace":10,"file":0,"vcns_hf3fs":0,"dummy":0,"event_report_l1p5":0,"event_report_l2":0})",
             storage_usage_data.Serialize());
+
+        storage_usage_data.SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD, 20);
+        EXPECT_EQ(
+            R"({"unknown":0,"hf3fs":0,"mooncake":0,"pace":10,"file":0,"vcns_hf3fs":0,"dummy":0,"event_report_l1p5":0,"event_report_l2":0,"pace_ssd":20})",
+            storage_usage_data.Serialize());
+    }
+
+    // Nonzero Valkey usage is persisted and recovered in its internal slot.
+    {
+        storage_usage_data.Reset();
+        storage_usage_data.SetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_VALKEY, 1234);
+        const std::string serialized = storage_usage_data.Serialize();
+        EXPECT_EQ(
+            R"({"unknown":0,"hf3fs":0,"mooncake":0,"pace":0,"file":0,"vcns_hf3fs":0,"dummy":0,"event_report_l1p5":0,"event_report_l2":0,"valkey":1234})",
+            serialized);
+
+        storage_usage_data.Reset();
+        ASSERT_EQ(EC_OK, storage_usage_data.Deserialize(serialized));
+        ASSERT_EQ(11u, storage_usage_data.storage_usage_by_type_.size());
+        EXPECT_EQ(1234u,
+                  storage_usage_data.storage_usage_by_type_
+                      .at(static_cast<std::size_t>(DataStorageType::DATA_STORAGE_TYPE_VALKEY))
+                      .load());
+        EXPECT_EQ(1234u, storage_usage_data.GetStorageUsageByType(DataStorageType::DATA_STORAGE_TYPE_VALKEY));
     }
 
     // Legal input: whitespace-padded JSON
     {
-        const std::vector<std::uint64_t> expected_usage_vec{1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
+        const std::vector<std::uint64_t> expected_usage_vec{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11};
         storage_usage_data.Reset();
         ASSERT_EQ(EC_OK,
                   storage_usage_data.Deserialize("  "
                                                  "{\"unknown\":1,\"hf3fs\":2,\"mooncake\":3,\"pace\":4,\"file\":5,"
                                                  "\"vcns_hf3fs\":6,\"dummy\":7,\"event_report_l1p5\":8,"
-                                                 "\"event_report_l2\":9,\"pace_ssd\":10}  "));
+                                                 "\"event_report_l2\":9,\"pace_ssd\":10,\"valkey\":11}  "));
         for (std::size_t i = 0; i != storage_usage_data.storage_usage_by_type_.size(); ++i) {
             ASSERT_EQ(expected_usage_vec.at(i), storage_usage_data.storage_usage_by_type_.at(i).load());
         }

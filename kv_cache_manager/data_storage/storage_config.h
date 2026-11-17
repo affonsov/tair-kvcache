@@ -21,6 +21,7 @@ enum class DataStorageType : uint8_t {
     // Keep the legacy TairMempool type for DRAM/backward compatibility and
     // account explicit SSD locations independently for quota and water level.
     DATA_STORAGE_TYPE_TAIR_MEMPOOL_SSD = 9,
+    DATA_STORAGE_TYPE_VALKEY = 10,
     COUNT, // as sentinel, must be last
 };
 
@@ -191,7 +192,7 @@ public:
     void set_skip_confirmed_missing_backend_delete(bool value) { skip_confirmed_missing_backend_delete_ = value; }
 
 private:
-    std::string domain_;                // 统一接入
+    std::string domain_; // 统一接入
     // 除健康检查外的 HTTP 请求超时，单位秒（分配、删除、同步复制、容量和节点查询）。
     // 连接和请求整体使用同一值，整体耗时包含连接时间。
     int64_t timeout_{0};
@@ -237,6 +238,20 @@ public:
 private:
     std::string root_path_;
     int32_t key_count_per_file_ = 0;
+};
+
+class ValkeyStorageSpec : public StorageSpec {
+public:
+    bool FromRapidValue(const rapidjson::Value &rapid_value) override;
+    void ToRapidWriter(rapidjson::Writer<rapidjson::StringBuffer> &writer) const noexcept override;
+    bool ValidateRequiredFields(std::string &invalid_fields) const override;
+    std::string ToString() const override;
+
+    const std::string &endpoint() const { return endpoint_; }
+    void set_endpoint(const std::string &endpoint) { endpoint_ = endpoint; }
+
+private:
+    std::string endpoint_;
 };
 
 class EventReportStorageSpec : public StorageSpec {

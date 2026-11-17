@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <chrono>
 #include <condition_variable>
 #include <functional>
 #include <memory>
@@ -24,6 +25,8 @@ public:
 
     class PoolState {
     public:
+        using Deadline = std::chrono::steady_clock::time_point;
+
         std::shared_ptr<ClientType> AcquireClient(int64_t lock_timeout_ms) {
             std::chrono::milliseconds timeout(lock_timeout_ms);
             {
@@ -36,6 +39,18 @@ public:
                 return client;
             }
             return nullptr;
+        }
+
+        std::shared_ptr<ClientType> AcquireClientUntil(Deadline deadline) {
+            std::unique_lock lock(mtx_);
+            if (std::chrono::steady_clock::now() >= deadline ||
+                !cv_.wait_until(lock, deadline, [this] { return !client_pool_.empty(); }) ||
+                std::chrono::steady_clock::now() >= deadline) {
+                return nullptr;
+            }
+            std::shared_ptr<ClientType> client = std::move(client_pool_.front());
+            client_pool_.pop();
+            return client;
         }
 
         void ReleaseClient(std::shared_ptr<ClientType> client, bool is_new = false) {
@@ -89,8 +104,18 @@ public:
         std::shared_ptr<ClientType> client_;
     };
 
+    using Deadline = std::chrono::steady_clock::time_point;
+
     virtual bool Initialize() = 0;
     virtual ClientHandle AcquireClient(int64_t timeout_ms = 1000) = 0;
+    virtual ClientHandle AcquireClientUntil(Deadline deadline) {
+        const std::shared_ptr<PoolState> pool_state = pool_state_;
+        if (!pool_state) {
+            return ClientHandle(nullptr, nullptr);
+        }
+        auto client = pool_state->AcquireClientUntil(deadline);
+        return ClientHandle(pool_state, std::move(client));
+    }
 
 protected:
     bool InitializePoolStateWithSize(size_t pool_size) {
@@ -124,6 +149,13 @@ public:
             return typename Base::ClientHandle(nullptr, nullptr);
         }
         auto client = this->pool_state_->AcquireClient(timeout_ms);
+        return typename Base::ClientHandle(this->pool_state_, std::move(client));
+    }
+    typename Base::ClientHandle AcquireClientUntil(typename Base::Deadline deadline) override {
+        if (!this->pool_state_) {
+            return typename Base::ClientHandle(nullptr, nullptr);
+        }
+        auto client = this->pool_state_->AcquireClientUntil(deadline);
         return typename Base::ClientHandle(this->pool_state_, std::move(client));
     }
 
@@ -165,6 +197,14 @@ public:
             client = this->pool_state_->AcquireClient(timeout_ms);
         }
 
+        return typename Base::ClientHandle(this->pool_state_, std::move(client));
+    }
+
+    typename Base::ClientHandle AcquireClientUntil(typename Base::Deadline deadline) override {
+        if (!this->pool_state_) {
+            return typename Base::ClientHandle(nullptr, nullptr);
+        }
+        auto client = this->pool_state_->AcquireClientUntil(deadline);
         return typename Base::ClientHandle(this->pool_state_, std::move(client));
     }
 
