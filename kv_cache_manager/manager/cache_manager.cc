@@ -1147,8 +1147,7 @@ ErrorCode CacheManager::ReportOptimizerEvent(RequestContext *request_context,
     return EC_OK;
 }
 
-void CacheManager::FillEmptyLocationSpecs(const InstanceInfoConstPtr &instance_info,
-                                          CacheLocationVector &locations) {
+void CacheManager::FillEmptyLocationSpecs(const InstanceInfoConstPtr &instance_info, CacheLocationVector &locations) {
     const auto &spec_infos = instance_info->location_spec_infos();
     for (auto &location : locations) {
         if (!location || location->spec_size() == 0) {
@@ -4730,9 +4729,10 @@ ErrorCode CacheManager::DoRecoverOnce() {
                 ++error_count;
                 continue;
             }
-            KVCM_LOG_INFO("CacheManager RegisterInstance success when recover, instance_id[%s], storage_config[%s]",
-                          instance_info->instance_id().c_str(),
-                          config_str.c_str());
+            KVCM_LOG_INFO(
+                "CacheManager RegisterInstance success when recover, instance_id[%s], storage_config_bytes[%zu]",
+                instance_info->instance_id().c_str(),
+                config_str.size());
         }
     }
 

@@ -248,10 +248,14 @@ public:
     std::string ToString() const override;
 
     const std::string &endpoint() const { return endpoint_; }
+    const std::string &security_dir() const { return security_dir_; }
+    bool secure() const { return endpoint_.compare(0, sizeof("valkeys://") - 1, "valkeys://") == 0; }
     void set_endpoint(const std::string &endpoint) { endpoint_ = endpoint; }
+    void set_security_dir(const std::string &security_dir) { security_dir_ = security_dir; }
 
 private:
     std::string endpoint_;
+    std::string security_dir_;
 };
 
 class EventReportStorageSpec : public StorageSpec {

@@ -108,7 +108,7 @@ bool StartupConfigLoader::Load(const std::string &startup_config_file) {
     StartupConfig startup_config;
     bool ret = startup_config.FromJsonString(config_str);
     if (!ret) {
-        KVCM_LOG_ERROR("Parse startup config failed, content=[%s]", config_str.c_str());
+        KVCM_LOG_ERROR("Parse startup config failed, config_bytes=[%zu]", config_str.size());
         return false;
     }
     RequestContext empty_context("system_startup");

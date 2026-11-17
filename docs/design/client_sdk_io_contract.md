@@ -177,6 +177,7 @@ qualified end to end against a live Valkey deployment.
 7. ManagerClient and RTPLLMClient calls that use TransferClient receive the
    wrapper budget without extra configuration.
 
-This contract covers the plaintext `valkey://` and `redis://` transports.
-Transport security and authentication for Valkey block storage are outside its
-scope.
+This contract applies to the plaintext `valkey://` and `redis://` transports and
+to `valkeys://`. TLS, named ACL authentication, and the `security_dir`
+credential reference are described in
+[Secure Valkey block storage](secure_valkey_storage.md).
